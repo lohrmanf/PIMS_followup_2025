@@ -1,0 +1,1681 @@
+---
+title: "Auswertung PIMS Nachsorge"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, include=FALSE}
+#load libraries
+library(data.table)
+library(ggplot2)
+library(tidyverse)
+library(gtsummary)
+library(ggpointdensity)
+library(RColorBrewer)
+library(viridis)
+library(survival)
+library(survminer)
+library(cowplot)
+library(gridExtra)
+library(logistf)
+library(gt)
+library(patchwork)
+
+dir <- "Results"
+dir.b <- "Results/Barplot"
+
+df<- read_csv("PIMS_BN.csv")
+```
+
+# initial setup1
+```{r, include=FALSE}
+#import data
+PIMS_all <- fread("PIMS-Erstmeldung-und-Nachsorge-Survey-Export-RAW-20231101.CSV", sep = ";", dec = ",")
+
+#List of patients with follow-up
+Pat_List <- fread("Liste_PatID_mit_Nachsorge.CSV", sep = ";", dec = ",")
+
+#List of variables
+Var_List <- scan("PIMS_Auswertung_Variablen.txt", what = character())
+
+#select patients and variables
+PIMS_all <- PIMS_all[case_id %in% Pat_List$Nr_unique]
+
+PIMS_BN <- PIMS_all[, ..Var_List]
+table(PIMS_BN$p2_img_cd_echo_cor_meas2)
+#change date format
+PIMS_BN[, ppatient_admission_date := lubridate::ymd(ppatient_admission_date)]
+
+
+#Baseline = 0
+PIMS_BN[is.na(redcap_repeat_instance), redcap_repeat_instance := 0]
+
+#Numbering follow-up visits
+PIMS_BN[, redcap_repeat_instance_l := factor(redcap_repeat_instance, levels = c(0,1,2,3,4,5,6), labels = c("Baseline", "Follow up 1", "Follow up 2", "Follow up 3", "Follow up 4", "Follow up 5", "Follow up 6"))]
+
+#add admission date to each line of same patient
+PIMS_BN[, ppatient_admission_date:= ppatient_admission_date[redcap_repeat_instance == 0], case_id]
+
+#New col with number of follow-up visits
+PIMS_BN[, max_repeat_instance := max(redcap_repeat_instance), by = case_id]
+```
+
+# initial setup2
+## Auswertung der Zeiträume zwischen stationärer Aufnahme und Nachsorge
+```{r, include=FALSE, warning=FALSE}
+#Calculate duration
+PIMS_BN[, admiss_appt_diff := difftime(p2_pat_appt_date, ppatient_admission_date, units="days")]
+
+#Correct years
+PIMS_BN[case_id == "3112" & redcap_repeat_instance == 1, p2_pat_appt_date := update(p2_pat_appt_date, year = 2021)]
+PIMS_BN[case_id == "4245" & redcap_repeat_instance == 1, p2_pat_appt_date := update(p2_pat_appt_date, year = 2021)]
+PIMS_BN[case_id == "6036" & redcap_repeat_instance == 2, p2_pat_appt_date := update(p2_pat_appt_date, year = 2021)]
+
+
+#Patients with negative duration: 
+PIMS_BN[admiss_appt_diff < 0, .(case_id, redcap_repeat_instance, ppatient_admission_date, p2_pat_appt_date)]
+
+#Change dates for patients with negative duration (Email Goretzki vom 05.06.24)
+#Pat. 1736-1
+PIMS_BN[case_id == "1736-1", ppatient_admission_date := update(ppatient_admission_date, year = 2020, month = 11, day = 16)]
+
+PIMS_BN[case_id == "1736-1" & redcap_repeat_instance == 1, p2_pat_appt_date := update(p2_pat_appt_date, year= 2021, month = 1, day = 28)]
+PIMS_BN[case_id == "1736-1" & redcap_repeat_instance == 2, p2_pat_appt_date := update(p2_pat_appt_date, year= 2021, month = 4, day = 30)]
+PIMS_BN[case_id == "1736-1" & redcap_repeat_instance == 3, p2_pat_appt_date := update(p2_pat_appt_date, year= 2021, month = 10, day = 22)]
+PIMS_BN[case_id == "1736-1" & redcap_repeat_instance == 4, p2_pat_appt_date := update(p2_pat_appt_date, year= 2022, month = 2, day = 4)]
+
+#Pat. 1736-6
+PIMS_BN[case_id == "1736-6", ppatient_admission_date := update(ppatient_admission_date, year = 2021, month = 1, day = 2)]
+
+PIMS_BN[case_id == "1736-6" & redcap_repeat_instance == 1, p2_pat_appt_date := update(p2_pat_appt_date, year= 2021, month = 2, day = 5)]
+PIMS_BN[case_id == "1736-6" & redcap_repeat_instance == 2, p2_pat_appt_date := update(p2_pat_appt_date, year= 2021, month = 4, day = 9)]
+PIMS_BN[case_id == "1736-6" & redcap_repeat_instance == 3, p2_pat_appt_date := update(p2_pat_appt_date, year= 2021, month = 7, day = 9)]
+PIMS_BN[case_id == "1736-6" & redcap_repeat_instance == 4, p2_pat_appt_date := update(p2_pat_appt_date, year= 2022, month = 1, day = 7)]
+PIMS_BN[case_id == "1736-6" & redcap_repeat_instance == 5, p2_pat_appt_date := update(p2_pat_appt_date, year= 2023, month = 1, day = 6)]
+
+#one patient without date on follow-up: 1711-7 remove or find out.
+case_id_to_remove <- "1711-7"
+
+#PIMS_BN <- PIMS_BN %>%
+ #filter(case_id != case_id_to_remove)
+
+PIMS_BN <- PIMS_BN[case_id != case_id_to_remove]
+
+#Recalculate durations
+PIMS_BN[, admiss_appt_diff := difftime(p2_pat_appt_date, ppatient_admission_date, units="days")]
+
+#Calculate durations between follow-up visits
+PIMS_BN[, appt_termin_diff := admiss_appt_diff - shift(admiss_appt_diff), by = case_id]
+
+PIMS_BN <- as.data.table(PIMS_BN)
+
+#check if order of visits is correct
+diff_neg <- PIMS_BN[appt_termin_diff < 0, .(case_id)]
+diff_neg <- as.data.table(diff_neg)
+
+
+diff_neg_table <- PIMS_BN[case_id %in% diff_neg$case_id, 
+                          .(case_id, redcap_repeat_instance, 
+                            ppatient_admission_date, 
+                            p2_pat_appt_date, admiss_appt_diff, 
+                            appt_termin_diff)]
+
+
+#correct order of visits
+PIMS_BN[case_id == "1712-5" & redcap_repeat_instance == 1, p2_pat_appt_date := update(p2_pat_appt_date, year= 2022, month = 2, day = 1)]
+PIMS_BN[case_id == "1712-5" & redcap_repeat_instance == 2, p2_pat_appt_date := update(p2_pat_appt_date, year= 2022, month = 4, day = 12)]
+
+PIMS_BN[case_id == "1736-10" & redcap_repeat_instance == 1, p2_pat_appt_date := update(p2_pat_appt_date, year= 2022, month = 8, day = 26)]
+PIMS_BN[case_id == "1736-10" & redcap_repeat_instance == 2, p2_pat_appt_date := update(p2_pat_appt_date, year= 2022, month = 11, day = 4)]
+
+PIMS_BN[case_id == "1736-11" & redcap_repeat_instance == 1, p2_pat_appt_date := update(p2_pat_appt_date, year= 2022, month = 7, day = 29)]
+PIMS_BN[case_id == "1736-11" & redcap_repeat_instance == 2, p2_pat_appt_date := update(p2_pat_appt_date, year= 2022, month = 10, day = 14)]
+
+#Recalculate durations
+PIMS_BN[, admiss_appt_diff := difftime(p2_pat_appt_date, ppatient_admission_date, units="days")]
+
+#Recalculate durations between follow-up visits
+PIMS_BN[, appt_termin_diff := admiss_appt_diff - shift(admiss_appt_diff), by = case_id]
+
+#Create groups according to duration
+PIMS_BN[admiss_appt_diff > 0 & admiss_appt_diff <= 30, diff_group := 1]
+PIMS_BN[admiss_appt_diff > 31 & admiss_appt_diff <= 90, diff_group := 2]
+PIMS_BN[admiss_appt_diff > 91, diff_group := 3]
+PIMS_BN[, diff_group_f := factor(diff_group, levels = c(1:3), labels = c("<= 30 Tage", "> 31 bis <= 90 Tage", "> 91 Tage"))]
+
+PIMS_BN <- PIMS_BN %>%
+  mutate(Time = ifelse(is.na(admiss_appt_diff), 0, admiss_appt_diff))
+
+write.csv(PIMS_BN, file = "PIMS_BN.csv", row.names = FALSE)
+
+```
+
+#search for variables
+```{r}
+letter_combination <- "p2_lab"
+
+# List all column names that start with the specified letter combination
+matching_columns <- grep(paste0("^", letter_combination), colnames(PIMS_all), value = TRUE)
+
+print(matching_columns)
+```
+
+
+#analysis starts here
+```{r}
+#search for cols
+term <- "va"
+matching_columns <- grep(term, colnames(df), value = TRUE)
+print(matching_columns)
+
+```
+
+#Overview figures
+# 1 create Time_Interval
+```{r}
+df <- df %>%
+  group_by(case_id) %>%
+  mutate(Time_Interval = lag(Time, default = 0)) %>%
+  mutate(Time_Interval = Time - Time_Interval) %>%
+  mutate(Visit_Number = row_number() - 1)  
+```
+
+#follow-up time with max_time
+```{r}
+# Prepare data for Kaplan-Meier
+df_KM <- df %>%
+  group_by(case_id) %>%
+  summarise(Max_Time = max(Time, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Event = 1)  # Mark all as events (1 for occurred)
+
+head(df_KM)
+dim(df_KM)
+
+km_fit <- survfit(Surv(Max_Time, Event) ~ 1, data = df_KM)
+
+str(km_fit)
+
+# Extract summary statistics
+median_time <- summary(km_fit)$table["median"]
+all_times <- km_fit$time
+length(all_times)
+
+
+first_event_time <- min(df_KM$Max_Time, na.rm = TRUE)
+last_event_time <- max(df_KM$Max_Time, na.rm = TRUE)
+q25 <- quantile(df_KM$Max_Time, probs = 0.25, na.rm = TRUE)
+q50 <- quantile(df_KM$Max_Time, probs = 0.5, na.rm = TRUE)
+q75 <- quantile(df_KM$Max_Time, probs = 0.75, na.rm = TRUE)
+
+# Display results
+cat("First event time:", first_event_time, "\n")
+cat("Last event time:", last_event_time, "\n")
+cat("25th percentile (Q25):", q25, "\n")
+cat("Median event time:", q50, "\n")
+cat("75th percentile (Q75):", q75, "\n")
+
+
+# Plot the Kaplan-Meier curve
+km_plot <- ggsurvplot(km_fit, 
+           conf.int = FALSE,                
+           xlab = "Time (days)", 
+           ylab = "% of Patients", 
+           title = "Patients in Follow-up (n=127)", 
+           legend = "none",                 
+           palette = "cornflowerblue",     
+           surv.scale = "percent",
+           surv.median.line = "hv")     
+
+km_plot$plot <- km_plot$plot +
+  annotate("text", x = 4 * median_time, y = 0.5, 
+           label = paste("Median =", round(median_time, 2), "days"), 
+           vjust = -1.5, color = "black", size = 4)+
+  theme(
+    plot.title = element_text(size = 14, face = "plain"),   
+    axis.title.x = element_text(size = 12),               
+    axis.title.y = element_text(size = 12),               
+    axis.text.x = element_text(size = 10),                
+    axis.text.y = element_text(size = 10)                 
+  )
+
+ggsave(paste0(dir, "/Followup.png"), width=4, height =3, dpi=600)
+```
+
+
+#follow-up intervals
+```{r}
+
+df_filtered <- df %>%
+  filter(Time_Interval > 0)
+
+counts <- df_filtered %>%
+  group_by(Visit_Number) %>%
+  summarize(n = n())
+
+ggplot(df_filtered, aes(x = as.factor(Visit_Number), y = Time_Interval)) +
+  geom_violin(trim = FALSE, color = "cornflowerblue") +
+  geom_text(data = counts, aes(x = as.factor(Visit_Number), y = max(df_filtered$Time_Interval) + 5, label = paste("n =", n)), 
+            vjust = 0, size = 4) +  
+  labs(title = "Intervals Between Visits", 
+       x = "Visit Number", 
+       y = "Time Interval (days)") +
+  theme_minimal() +
+  scale_y_continuous(limits = c(0, NA))+
+  theme(
+    plot.title = element_text(size = 14, face = "plain"),   
+    axis.title.x = element_text(size = 12),               
+    axis.title.y = element_text(size = 12),               
+    axis.text.x = element_text(size = 10),                
+    axis.text.y = element_text(size = 10)                 
+  )
+
+ggsave(paste0(dir, "/Intervals.png"), width=4, height =3, dpi=600)
+```
+
+#verify that all patients have at least one follow-up
+```{r}
+patient_follow_up_count <- df %>%
+  group_by(case_id) %>%
+  summarise(n_visits = n())
+
+# Find patients with only one visit (no follow-up)
+patients_without_followup <- patient_follow_up_count %>%
+  filter(n_visits == 1)
+
+# Print the result
+patients_without_followup
+```
+
+
+#Create cols for comparisons
+```{r}
+#comparisons <- c(ICU, Gender, Age.group, 
+
+df <- df %>%
+  group_by(case_id) %>% 
+  mutate(ICU = ifelse(is.na(first(pther_icu_days)) | first(pther_icu_days) == 0, 0, 1))%>%  
+  ungroup()
+
+df <- df %>%
+  group_by(case_id) %>% 
+  mutate(Age.group = ifelse(first(ppatient_age_years) < 6, 0, 1))%>%  
+  ungroup()
+
+#gender: 1 = male (afterwards 0= male)
+df <- df %>%
+  group_by(case_id) %>% 
+  mutate(Gender = ifelse(first(ppatient_gender) == 1, 0, 1)) %>%  
+  ungroup()
+
+#BMI, Kidney, Comorb, Compl.ther
+df <- df %>%
+  group_by(case_id) %>% 
+  mutate(BMI = ifelse(first(ppatient_bmi) < 25, 0, 1))%>%  
+  ungroup()
+
+df <- df %>%
+  group_by(case_id) %>% 
+  mutate(Kidney = ifelse(first(pcomp_kidney_type___1) == 1, 1, 0))%>%  
+  ungroup()
+
+df <- df %>%
+  group_by(case_id) %>% 
+  mutate(Comorb = ifelse(first(pcomorb_pims_chk == 1), 1, 0))%>%  
+  ungroup()
+
+df <- df %>%
+  group_by(case_id) %>% 
+  mutate(Compl.ther = ifelse(first(pther_immun_mod_type___2) == 1 & first(pther_immun_mod_type___13) ==1, 1, 0))%>%  
+  ungroup()
+```
+
+
+
+# categorical variable
+#filter for patients with symptom present during initial stay and on at least one follow-up
+```{r}
+#1. myocardial dysfunction
+df_myocard <- df %>%
+  group_by(case_id) %>%
+  filter(any(pimg_echo_myocard_yesno == 1)) %>%
+  ungroup()
+
+df_myocard <- df_myocard %>%
+  group_by(case_id) %>%
+  filter(any(p2_img_cd_echo_myocard %in% c(0, 1))) %>%
+  ungroup()
+
+df_myocard <- df_myocard %>%
+  mutate(myocard = ifelse(!is.na(pimg_echo_myocard_yesno), pimg_echo_myocard_yesno, p2_img_cd_echo_myocard))
+
+# Fill NA values if 1 before and after
+df_myocard <- df_myocard %>% 
+  group_by(case_id) %>% 
+  mutate(
+    myocard_mod = ifelse(
+      is.na(myocard) &
+      lag(myocard, default = 0) == 1 &
+      lead(myocard, default = 0) == 1,
+      1, myocard
+    )
+  )
+
+#create variable persistent=1 versus recovered=0 for myocard: myocard_persist
+df_myocard <- df_myocard %>%
+  group_by(case_id) %>% 
+  mutate(myocard_persist = as.integer(any(replace_na(myocard[Visit_Number >= 1], 0) == 1))) %>% 
+  ungroup()
+                                                 
+
+#View(df_myocard %>% select(c("case_id", "myocard", "myocard_mod", "Time", "Visit_Number", "ICU", "myocard_persist")))
+
+
+#2. Coronary pathology
+df_coronary <- df %>%
+  group_by(case_id) %>%
+  filter(any(pimg_echo_coronpath_yesno == 1)) %>%
+  ungroup()
+
+df_coronary <- df_coronary %>%
+  group_by(case_id) %>%
+  filter(any(p2_img_cd_echo_coronpath %in% c(0, 1))) %>%
+  ungroup()
+
+df_coronary <- df_coronary %>%
+  mutate(coronary = ifelse(!is.na(pimg_echo_coronpath_yesno), pimg_echo_coronpath_yesno, p2_img_cd_echo_coronpath))
+
+length(unique(df_coronary$case_id))
+
+# Fill NA values if 1 before and after
+df_coronary <- df_coronary %>% 
+  group_by(case_id) %>% 
+  mutate(
+    coronary_mod = ifelse(
+      is.na(coronary) &
+      lag(coronary, default = 0) == 1 &
+      lead(coronary, default = 0) == 1,
+      1, coronary
+    )
+  )
+
+table(df_coronary$coronary)
+
+#create variable persistent=1 versus recovered=0 for coronary: coronary_persist
+df_coronary <- df_coronary %>%
+  group_by(case_id) %>% 
+  mutate(coronary_persist = as.integer(any(replace_na(coronary[Visit_Number >= 1], 0) == 1))) %>% 
+  ungroup()
+
+#View(df_coronary %>% select(c("case_id", "coronary", "coronary_mod", "Time", "Visit_Number", "ICU", "coronary_persist")))
+
+
+
+### clinical symptoms
+
+#___3: cardio
+#___4: gastro
+#___7: neuro
+#___8: musculo
+#___10: hemato
+#___12: skin
+#___14: general
+
+create_subsets <- function(df) {
+  
+  suffix_numbers <- c(3, 4, 7, 8, 10, 12, 14)
+  colnames <- c("cardio", "gastro", "neuro", "musculo", "hemato", "skin", "general")
+  
+  for (i in seq_along(suffix_numbers)) {
+    suffix <- suffix_numbers[[i]]
+    colname <- colnames[[i]]
+    
+    # Subsetting based on p1 and p2 columns with the provided suffix
+    df_subset <- df %>%
+      group_by(case_id) %>%
+      filter(any(.data[[paste0("p1_sy_sympt_type___", suffix)]] == 1)) %>%
+      ungroup()
+    
+    df_subset <- df_subset %>%
+      group_by(case_id) %>%
+      filter(any(.data[[paste0("p2_sy_sympt_type___", suffix)]] %in% c(0, 1))) %>%
+      ungroup()
+    
+    # Mutating new column based on p1 and p2 with the provided suffix
+    df_subset <- df_subset %>%
+      mutate(!!colname := ifelse(!is.na(.data[[paste0("p1_sy_sympt_type___", suffix)]]), 
+                                 .data[[paste0("p1_sy_sympt_type___", suffix)]], 
+                                 .data[[paste0("p2_sy_sympt_type___", suffix)]]))
+    
+    # Assign the subset to a variable with the provided name
+    assign(paste0("df_", colname), df_subset, envir = .GlobalEnv)
+  }
+}
+
+create_subsets(df)
+
+
+
+df_cardio <- df_cardio %>%
+  group_by(case_id) %>% 
+  mutate(cardio_persist = as.integer(any(replace_na(cardio[Visit_Number >= 1], 0) == 1))) %>% 
+  ungroup()
+
+
+# List of dataframe names
+df_list <- c("df_cardio",  "df_gastro", "df_neuro", "df_musculo", "df_hemato", "df_skin", "df_general")
+
+# Loop through each dataframe
+for (df_name in df_list) {
+  persist_col <- paste0(gsub("df_", "", df_name), "_persist")  
+  condition_col <- gsub("df_", "", df_name)                    
+  
+  assign(df_name, get(df_name) %>%
+    group_by(case_id) %>%
+    mutate(!!persist_col := as.integer(any(replace_na(.data[[condition_col]][Visit_Number >= 1], 0) == 1))) %>%
+    ungroup())
+}
+
+
+#View(df_general %>% select(c("case_id", "general", "Time", "Visit_Number", "ICU", "general_persist")))
+
+
+
+#create "any symptom" df
+all_suffix_numbers <- 1:14
+p1_cols <- paste0("p1_sy_sympt_type___", all_suffix_numbers)
+p2_cols <- paste0("p2_sy_sympt_type___", all_suffix_numbers)
+
+
+# Step 1: Filter for case_ids where any row has p1 = 1 (case_id-level filtering)
+df_any <- df %>%
+  group_by(case_id) %>%
+  filter(any(across(all_of(p1_cols), ~ . == 1))) %>%  # Check any p1 = 1 within case_id
+  ungroup()
+
+# Step 2: Add row-wise flag for p2 (row-level evaluation, treating NA as 0)
+df_any <- df_any %>%
+  rowwise() %>%  # Row-wise operation for each visit
+  mutate(any_p2_1 = ifelse(
+    Visit_Number == 0,  # Condition for Visit 0
+    1,                  # Always set to 1 for Visit 0
+    ifelse(any(replace_na(c_across(all_of(p2_cols)), 0) == 1), 1, 0)  
+  )) %>%
+  ungroup() 
+
+# Step 3: add persist col
+df_any <- df_any %>%
+  group_by(case_id) %>% 
+  mutate(any_persist = as.integer(any(replace_na(any_p2_1[Visit_Number >= 1], 0) == 1))) %>% 
+  ungroup()
+
+dim(df_any)
+
+View(df_any   %>% select(c("case_id", "Visit_Number", "any_p2_1", "any_persist", "p2_sy_sympt_type___1",  "p2_sy_sympt_type___2",  "p2_sy_sympt_type___3",  "p2_sy_sympt_type___4", 
+ "p2_sy_sympt_type___5",  "p2_sy_sympt_type___6",  "p2_sy_sympt_type___7",  "p2_sy_sympt_type___8", "p2_sy_sympt_type___9",  "p2_sy_sympt_type___10", "p2_sy_sympt_type___11", "p2_sy_sympt_type___12",
+"p2_sy_sympt_type___13", "p2_sy_sympt_type___14")))
+
+
+#create any echo col
+
+
+# Perform table on Age.group for unique case_id
+p1_cols <- c("pimg_echo_myocard_yesno",
+             "pimg_echo_valvulit_yesno",
+             "pimg_echo_coronpath_yesno",
+             "pimg_echo_coroneury_yesno")
+
+p2_cols <- c("p2_img_cd_echo_coroneury", 
+             "p2_img_cd_echo_coronpath", 
+             "p2_img_cd_echo_myocard", 
+             "p2_img_cd_echo_valvulit")
+
+# Step 1: Filter for case_ids where any row has p1 = 1 (case_id-level filtering)
+df_echo <- df %>%
+  group_by(case_id) %>%
+  filter(any(across(all_of(p1_cols), ~ . == 1))) %>%  # Check any p1 = 1 within case_id
+  ungroup()
+
+# Step 2: Add row-wise flag for p2 (row-level evaluation, treating NA as 0)
+df_echo <- df_echo %>%
+  rowwise() %>%  # Row-wise operation for each visit
+  mutate(echo = ifelse(
+    Visit_Number == 0,  # Condition for Visit 0
+    1,                  # Always set to 1 for Visit 0
+    ifelse(any(replace_na(c_across(all_of(p2_cols)), 0) == 1), 1, 0)  
+  )) %>%
+  ungroup() 
+
+# Step 3: add persist col
+df_echo <- df_echo %>%
+  group_by(case_id) %>% 
+  mutate(echo_persist = as.integer(any(replace_na(echo[Visit_Number >= 1], 0) == 1))) %>% 
+  ungroup()
+
+# Fill NA values if 1 before and after
+df_echo <- df_echo %>% 
+  group_by(case_id) %>% 
+  mutate(
+    echo_mod = ifelse(
+      is.na(echo) &
+      lag(echo, default = 0) == 1 &
+      lead(echo, default = 0) == 1,
+      1, echo
+    )
+  )
+
+
+dim(df_echo)
+table(df_echo$echo)
+table(df_echo$echo_mod)
+
+#View(df_echo   %>% select(c("case_id", "Visit_Number", "echo", "echo_mod", "echo_persist")))
+
+
+```
+
+#plot bar chart
+```{r}
+# Plot stacked bar chart split by variable
+group_var <- "Age.group"  
+
+custom_labels <- list(
+  Gender = c("0" = "Male", "1" = "Female"),
+  ICU = c("0" = "No ICU", "1" = "ICU"),
+  Comorb = c("0" = "No comorbidity", "1" = "Comorbidity"),
+  Age.group = c("0" = "Young", "1" = "Old"),
+  Compl.ther = c("0" = "Incomplete therapy", "1" = "Complete therapy")
+)
+```
+
+#plot all bar plots
+```{r}
+#echo
+plot_echo <- df_echo %>% 
+  filter(!is.na(echo_mod)) %>% 
+  group_by(Visit_Number, .data[[group_var]], echo_mod) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+ggplot(plot_echo, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(echo_mod, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Echocardiographic \npathology") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+# Save plot
+ggsave(paste0(dir.b, "/bar_echo_", group_var, ".png"), dpi = 600, width = 5, height = 3)
+
+
+#myocard
+plot_myocard <- df_myocard %>% 
+  filter(!is.na(myocard_mod)) %>% 
+  group_by(Visit_Number, .data[[group_var]], myocard_mod) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+ggplot(plot_myocard, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(myocard_mod, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Myocardial \ndysfunction") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+# Save plot
+ggsave(paste0(dir.b, "/bar_myocard_", group_var, ".png"), dpi = 600, width = 5, height = 3)
+
+
+#coronary
+plot_coronary <- df_coronary %>% 
+  filter(!is.na(coronary_mod)) %>% 
+  group_by(Visit_Number, .data[[group_var]], coronary_mod) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+ggplot(plot_coronary, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(coronary_mod, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Coronary \ndilatation") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+# Save plot
+ggsave(paste0(dir.b, "/bar_coronary_", group_var, ".png"), dpi = 600, width = 5, height = 3)
+
+
+#cardio
+plot_cardio <- df_cardio %>% 
+  filter(!is.na(cardio)) %>% 
+  group_by(Visit_Number, .data[[group_var]], cardio) %>% 
+  summarise(count = n(), .groups = "drop")
+
+# Generate plot
+ggplot(plot_cardio, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(cardio, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Cardiovascular \nsymptoms") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+# Save plot
+ggsave(paste0(dir.b, "/bar_cardio_", group_var, ".png"), dpi = 600, width = 5, height = 3)
+
+
+#general
+plot_general <- df_general %>% 
+  filter(!is.na(general)) %>% 
+  group_by(Visit_Number, .data[[group_var]], general) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+ggplot(plot_general, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(general, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "General \nsymptoms") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+# Save plot
+ggsave(paste0(dir.b, "/bar_general_", group_var, ".png"), dpi = 600, width = 5, height = 3)
+
+
+#Any symptom
+plot_any <- df_any %>% 
+  filter(!is.na(any_p2_1)) %>% 
+  group_by(Visit_Number, .data[[group_var]], any_p2_1) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+ggplot(plot_any, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(any_p2_1, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Any \nsymptoms") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+# Save plot
+ggsave(paste0(dir.b, "/bar_any_", group_var, ".png"), dpi = 600, width = 5, height = 3)
+
+```
+
+#plot final selection including layout
+```{r}
+#clinical with linear regression
+#Any symptom
+
+group_var <- "ICU" 
+
+plot_any <- df_any %>% 
+  filter(!is.na(any_p2_1)) %>% 
+  group_by(Visit_Number, .data[[group_var]], any_p2_1) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+any_plot <- ggplot(plot_any, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(any_p2_1, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Any \nsymptoms") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+#general
+plot_general <- df_general %>% 
+  filter(!is.na(general)) %>% 
+  group_by(Visit_Number, .data[[group_var]], general) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+general_plot <- ggplot(plot_general, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(general, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "General \nsymptoms") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+#cardio
+
+group_var <- "Age.group" 
+
+plot_cardio <- df_cardio %>% 
+  filter(!is.na(cardio)) %>% 
+  group_by(Visit_Number, .data[[group_var]], cardio) %>% 
+  summarise(count = n(), .groups = "drop")
+
+# Generate plot
+cardio_plot <- ggplot(plot_cardio, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(cardio, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Cardiovascular \nsymptoms") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+any_plot+general_plot+cardio_plot+plot_layout(ncol=1)
+
+# Save plot
+ggsave(paste0(dir, "/bar_selection_with_model.png"), dpi = 600, width = 5, height = 9.2)
+```
+
+```{r}
+#clinical without comparison
+
+# Skin
+plot_skin <- df_skin %>% 
+  filter(!is.na(skin)) %>% 
+  group_by(Visit_Number, skin) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+skin_plot <- ggplot(plot_skin, aes(x = factor(Visit_Number), y = count, 
+                      fill = factor(skin, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  labs(x = "Visit number", y = "Number of patients", fill = "Dermatologic \nsymptoms") +
+  theme_minimal()
+
+
+# Gastro
+plot_gastro <- df_gastro %>% 
+  filter(!is.na(gastro)) %>% 
+  group_by(Visit_Number, gastro) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+gastro_plot <- ggplot(plot_gastro, aes(x = factor(Visit_Number), y = count, 
+                        fill = factor(gastro, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  labs(x = "Visit number", y = "Number of patients", fill = "Gastrointestinal \nsymptoms") +
+  theme_minimal()
+
+
+# Musculoskeletal
+plot_musculo <- df_musculo %>% 
+  filter(!is.na(musculo)) %>% 
+  group_by(Visit_Number, musculo) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+musculo_plot <- ggplot(plot_musculo, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(musculo, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  labs(x = "Visit number", y = "Number of patients", fill = "Musculoskeletal \nsymptoms") +
+  theme_minimal()
+
+
+skin_plot+gastro_plot+musculo_plot+plot_layout(ncol=3)
+
+# Save plot
+ggsave(paste0(dir, "/bar_clin_no_comparison.png"), dpi = 600, width = 10.2, height = 3)
+
+```
+
+
+```{r}
+#### Echo results
+group_var <- "Age.group"  
+
+#echo
+plot_echo <- df_echo %>% 
+  filter(!is.na(echo_mod)) %>% 
+  group_by(Visit_Number, .data[[group_var]], echo_mod) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+echo_plot <- ggplot(plot_echo, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(echo_mod, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Echocardiographic \nabnormality") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+
+
+#myocard
+plot_myocard <- df_myocard %>% 
+  filter(!is.na(myocard_mod)) %>% 
+  group_by(Visit_Number, .data[[group_var]], myocard_mod) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+myocard_plot <- ggplot(plot_myocard, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(myocard_mod, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Myocardial \ndysfunction") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+
+
+#coronary
+plot_coronary <- df_coronary %>% 
+  filter(!is.na(coronary_mod)) %>% 
+  group_by(Visit_Number, .data[[group_var]], coronary_mod) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+coro_plot <-ggplot(plot_coronary, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(coronary_mod, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Coronary \ndilatation") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+
+layout <- paste0(
+  "A#\n",
+  "BC"
+)
+
+echo_plot + myocard_plot + coro_plot + 
+  plot_layout(design = layout)
+
+# Save plot
+ggsave(paste0(dir, "/bar_echo_combined_", group_var, ".png"), dpi = 600, width = 10.2, height = 6.1)
+```
+
+
+
+#linear models
+
+#Exploratory models
+```{r}
+
+#myocard
+
+#condense into one line per patient
+df_myocard_model <- df_myocard %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+View(df_myocard_model %>% select(c("case_id", "myocard_persist", "ICU", "Gender", "ppatient_age_years", "ppatient_bmi", "Comorb")))
+
+model_myoc <- glm(myocard_persist ~ ICU + ppatient_age_years + Gender + Comorb, data = df_myocard_model, family = binomial(link = "logit"))
+
+summary(model_myoc)
+
+#coronary
+
+#condense into one line per patient
+df_coronary_model <- df_coronary %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+#View(df_coronary_model %>% select(c("case_id", "coronary_persist", "ICU", "Gender", "ppatient_age_years", "ppatient_bmi", "Comorb")))
+
+model_coro <- glm(coronary_persist ~ ICU + ppatient_age_years + Gender + Comorb, data = df_coronary_model, family = binomial(link = "logit"))
+
+summary(model_coro)
+```
+
+#models to keep and clean
+```{r}
+#cardio
+
+#condense into one line per patient
+df_cardio_model <- df_cardio %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+View(df_cardio_model %>% select(c("case_id", "cardio_persist", "ICU", "Gender", "ppatient_age_years", "ppatient_bmi", "Comorb")))
+
+model_cardio <- glm(cardio_persist ~ ICU + ppatient_age_years + Gender  + Comorb, data = df_cardio_model, family = binomial(link = "logit"))
+
+summary(model_cardio)
+
+
+
+#clean up the result table of the model
+
+rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)")
+
+model_cardio_df<- as.data.frame(coef(summary(model_cardio)))
+head(model_cardio_df)
+
+model_cardio_df$Estimate <- exp(model_cardio_df$Estimate)
+model_cardio_df <- model_cardio_df[, -c(2,3)]
+colnames(model_cardio_df) <- c("Odds ratio", "p-value")
+
+model_cardio_df<- model_cardio_df[-1, ]
+
+rownames(model_cardio_df) <- rownames.model
+
+model_cardio_df$`p-value` <- ifelse(model_cardio_df$`p-value` < 0.001, "<0.001", round(model_cardio_df$`p-value`, 3))
+
+model_cardio_df$'Odds ratio' <- ifelse(model_cardio_df$'Odds ratio' > 10, ">10", round(model_cardio_df$'Odds ratio', 3))
+
+model_cardio_df$'Odds ratio' <- as.character(model_cardio_df$'Odds ratio')
+
+conf_intervals <- as.data.frame(confint(model_cardio, level = 0.95))
+conf_intervals <- exp(conf_intervals)
+conf_intervals$'95% CI' <- paste("(", round(conf_intervals$'2.5 %', 3), "; ", round(conf_intervals$'97.5 %', 3), ")", sep = "")
+
+conf_intervals$'95% CI' <- ifelse(
+  is.na(conf_intervals$'2.5 %') | is.na(conf_intervals$'97.5 %'), 
+  "ND",  
+  paste("(", round(conf_intervals$'2.5 %', 3), "; ", round(conf_intervals$'97.5 %', 3), ")", sep = "")
+)
+
+conf_intervals <- conf_intervals[-1,-c(1,2), drop = F]
+
+rownames(conf_intervals) <- rownames.model
+
+model_cardio_df$RowID <- rownames(model_cardio_df)
+conf_intervals$RowID <- rownames(conf_intervals)
+
+model_cardio_df$RowIndex <- 1:nrow(model_cardio_df)
+
+model_cardio_compl <- merge(model_cardio_df, conf_intervals, by = "RowID")
+
+model_cardio_compl <- model_cardio_compl[order(model_cardio_compl$RowIndex), ]
+
+model_cardio_compl$RowIndex <- NULL
+
+model_cardio_compl<- model_cardio_compl[c("RowID", "Odds ratio", "95% CI", "p-value")]
+names(model_cardio_compl)[names(model_cardio_compl) == "RowID"] <- "Variable"
+
+head(model_cardio_compl)
+
+```
+
+```{r}
+#general
+#condense into one line per patient
+df_general_model <- df_general %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+View(df_general_model %>% select(c("case_id", "general_persist", "ICU", "Gender", "ppatient_age_years", "ppatient_bmi", "Comorb")))
+
+model_general <- glm(general_persist ~ ICU + ppatient_age_years + Gender  + Comorb, data = df_general_model, family = binomial(link = "logit"))
+
+summary(model_general)
+
+
+#clean up the result table of the model
+rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)")
+
+model_general_df<- as.data.frame(coef(summary(model_general)))
+head(model_general_df)
+
+model_general_df$Estimate <- exp(model_general_df$Estimate)
+model_general_df <- model_general_df[, -c(2,3)]
+colnames(model_general_df) <- c("Odds ratio", "p-value")
+
+model_general_df<- model_general_df[-1, ]
+
+rownames(model_general_df) <- rownames.model
+
+model_general_df$`p-value` <- ifelse(model_general_df$`p-value` < 0.001, "<0.001", round(model_general_df$`p-value`, 3))
+
+model_general_df$'Odds ratio' <- ifelse(model_general_df$'Odds ratio' > 10, ">10", round(model_general_df$'Odds ratio', 3))
+
+model_general_df$'Odds ratio' <- as.character(model_general_df$'Odds ratio')
+
+conf_intervals <- as.data.frame(confint(model_general, level = 0.95))
+conf_intervals <- exp(conf_intervals)
+conf_intervals$'95% CI' <- paste("(", round(conf_intervals$'2.5 %', 3), "; ", round(conf_intervals$'97.5 %', 3), ")", sep = "")
+
+conf_intervals$'95% CI' <- ifelse(
+  is.na(conf_intervals$'2.5 %') | is.na(conf_intervals$'97.5 %'), 
+  "ND",  
+  paste("(", round(conf_intervals$'2.5 %', 3), "; ", round(conf_intervals$'97.5 %', 3), ")", sep = "")
+)
+
+conf_intervals <- conf_intervals[-1,-c(1,2), drop = F]
+
+rownames(conf_intervals) <- rownames.model
+
+model_general_df$RowID <- rownames(model_general_df)
+conf_intervals$RowID <- rownames(conf_intervals)
+
+model_general_df$RowIndex <- 1:nrow(model_general_df)
+
+model_general_compl <- merge(model_general_df, conf_intervals, by = "RowID")
+
+model_general_compl <- model_general_compl[order(model_general_compl$RowIndex), ]
+
+model_general_compl$RowIndex <- NULL
+
+model_general_compl<- model_general_compl[c("RowID", "Odds ratio", "95% CI", "p-value")]
+names(model_general_compl)[names(model_general_compl) == "RowID"] <- "Variable"
+
+head(model_general_compl)
+
+```
+
+```{r}
+#any
+#condense into one line per patient
+df_any_model <- df_any %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+model_any <- glm(any_persist ~ ICU + ppatient_age_years + Gender + Comorb, data = df_any_model, family = binomial(link = "logit"))
+
+summary(model_any)
+
+
+
+#clean up the result table of the model
+
+rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)")
+
+model_any_df<- as.data.frame(coef(summary(model_any)))
+head(model_any_df)
+
+model_any_df$Estimate <- exp(model_any_df$Estimate)
+model_any_df <- model_any_df[, -c(2,3)]
+colnames(model_any_df) <- c("Odds ratio", "p-value")
+
+model_any_df<- model_any_df[-1, ]
+
+rownames(model_any_df) <- rownames.model
+
+model_any_df$`p-value` <- ifelse(model_any_df$`p-value` < 0.001, "<0.001", round(model_any_df$`p-value`, 3))
+
+model_any_df$'Odds ratio' <- ifelse(model_any_df$'Odds ratio' > 10, ">10", round(model_any_df$'Odds ratio', 3))
+
+model_any_df$'Odds ratio' <- as.character(model_any_df$'Odds ratio')
+
+conf_intervals <- as.data.frame(confint(model_any, level = 0.95))
+conf_intervals <- exp(conf_intervals)
+conf_intervals$'95% CI' <- paste("(", round(conf_intervals$'2.5 %', 3), "; ", round(conf_intervals$'97.5 %', 3), ")", sep = "")
+
+conf_intervals$'95% CI' <- ifelse(
+  is.na(conf_intervals$'2.5 %') | is.na(conf_intervals$'97.5 %'), 
+  "ND",  
+  paste("(", round(conf_intervals$'2.5 %', 3), "; ", round(conf_intervals$'97.5 %', 3), ")", sep = "")
+)
+
+conf_intervals <- conf_intervals[-1,-c(1,2), drop = F]
+
+rownames(conf_intervals) <- rownames.model
+
+model_any_df$RowID <- rownames(model_any_df)
+conf_intervals$RowID <- rownames(conf_intervals)
+
+model_any_df$RowIndex <- 1:nrow(model_any_df)
+
+model_any_compl <- merge(model_any_df, conf_intervals, by = "RowID")
+
+model_any_compl <- model_any_compl[order(model_any_compl$RowIndex), ]
+
+model_any_compl$RowIndex <- NULL
+
+model_any_compl<- model_any_compl[c("RowID", "Odds ratio", "95% CI", "p-value")]
+names(model_any_compl)[names(model_any_compl) == "RowID"] <- "Variable"
+
+head(model_any_compl)
+
+```
+
+```{r}
+#echo
+
+#condense into one line per patient
+df_echo_model <- df_echo %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+View(df_echo_model %>% select(c("case_id", "echo_persist", "ICU", "Gender", "ppatient_age_years",  "Comorb")))
+
+model_echo <- glm(echo_persist ~ ICU + ppatient_age_years + Gender + Comorb, data = df_echo_model, family = binomial(link = "logit"))
+
+summary(model_echo)
+
+#clean up the result table of the model
+
+rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)")
+
+model_echo_df<- as.data.frame(coef(summary(model_echo)))
+head(model_echo_df)
+
+model_echo_df$Estimate <- exp(model_echo_df$Estimate)
+model_echo_df <- model_echo_df[, -c(2,3)]
+colnames(model_echo_df) <- c("Odds ratio", "p-value")
+
+model_echo_df<- model_echo_df[-1, ]
+
+rownames(model_echo_df) <- rownames.model
+
+model_echo_df$`p-value` <- ifelse(model_echo_df$`p-value` < 0.001, "<0.001", round(model_echo_df$`p-value`, 3))
+
+model_echo_df$'Odds ratio' <- ifelse(model_echo_df$'Odds ratio' > 10, ">10", round(model_echo_df$'Odds ratio', 3))
+
+model_echo_df$'Odds ratio' <- as.character(model_echo_df$'Odds ratio')
+
+conf_intervals <- as.data.frame(confint(model_echo, level = 0.95))
+conf_intervals <- exp(conf_intervals)
+conf_intervals$'95% CI' <- paste("(", round(conf_intervals$'2.5 %', 3), "; ", round(conf_intervals$'97.5 %', 3), ")", sep = "")
+
+conf_intervals$'95% CI' <- ifelse(
+  is.na(conf_intervals$'2.5 %') | is.na(conf_intervals$'97.5 %'), 
+  "ND",  
+  paste("(", round(conf_intervals$'2.5 %', 3), "; ", round(conf_intervals$'97.5 %', 3), ")", sep = "")
+)
+
+conf_intervals <- conf_intervals[-1,-c(1,2), drop = F]
+
+rownames(conf_intervals) <- rownames.model
+
+model_echo_df$RowID <- rownames(model_echo_df)
+conf_intervals$RowID <- rownames(conf_intervals)
+
+model_echo_df$RowIndex <- 1:nrow(model_echo_df)
+
+model_echo_compl <- merge(model_echo_df, conf_intervals, by = "RowID")
+
+model_echo_compl <- model_echo_compl[order(model_echo_compl$RowIndex), ]
+
+model_echo_compl$RowIndex <- NULL
+
+model_echo_compl<- model_echo_compl[c("RowID", "Odds ratio", "95% CI", "p-value")]
+names(model_echo_compl)[names(model_echo_compl) == "RowID"] <- "Variable"
+
+head(model_echo_compl)
+
+```
+
+
+#create gt tables
+```{r}
+#model_any_compl, model_general_compl, model_cardio_compl
+
+any_gt <- gt(model_any_compl, rownames_to_stub = F) %>%
+  tab_header(title = "Persistence of any symptoms") %>%
+  tab_options(table.font.size = px(10),
+    table.border.top.style = "none")%>%
+  cols_align(align = "left", columns = 1) %>%
+  cols_align(align = "center", columns = -1)
+
+general_gt <- gt(model_general_compl, rownames_to_stub = F) %>%
+  tab_header(title = "Persistence of general symptoms") %>%
+  tab_options(table.font.size = px(10),
+    table.border.top.style = "none")%>%
+  cols_align(align = "left", columns = 1) %>%
+  cols_align(align = "center", columns = -1)
+
+cardio_gt <- gt(model_cardio_compl, rownames_to_stub = F) %>%
+  tab_header(title = "Persistence of cardiovascular symptoms") %>%
+  tab_options(table.font.size = px(10),
+    table.border.top.style = "none")%>%
+  cols_align(align = "left", columns = 1) %>%
+  cols_align(align = "center", columns = -1)
+
+echo_gt <- gt(model_echo_compl, rownames_to_stub = F) %>%
+  tab_header(title = "Persistence of echocardiographic abnormalities") %>%
+  tab_options(table.font.size = px(10),
+    table.border.top.style = "none")%>%
+  cols_align(align = "left", columns = 1) %>%
+  cols_align(align = "center", columns = -1)
+
+
+#Sys.setenv(CHROMOTE_CHROME = "C:/Users/lohrmanf/AppData/Local/Google/Chrome/Application/chrome.exe")
+
+Sys.setenv(CHROMOTE_CHROME =
+"C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe")
+
+gtsave(any_gt, filename = "Results/any_gt_glm.png")
+gtsave(general_gt, filename = "Results/general_gt_glm.png")
+gtsave(cardio_gt, filename = "Results/cardio_gt_glm.png")
+gtsave(echo_gt, filename = "Results/echo_gt_glm.png")
+```
+
+
+#explore some cohort variables
+```{r}
+head(df)
+range(df$ppatient_admission_date)
+df$p2_pat_appt_date <- as.Date(df$p2_pat_appt_date)
+range(df$p2_pat_appt_date, na.rm = TRUE)
+
+str(df$p2_pat_appt_date)
+
+hist(df$Visit_Number)
+median_value <- median(df$Visit_Number[df$Visit_Number != 0], na.rm = TRUE)
+median(df$Visit_Number)
+# Print the result
+print(median_value)
+
+table(df$pcomorb_pims_chk)
+
+case_ids <- df_myocard$case_id[df_myocard$myocard_persist == 1]
+
+unique_case_ids <- unique(case_ids)
+
+#"1331" "6392"
+
+case_coro <- df_coronary$case_id[df_coronary$coronary_persist == 1]
+unique_case_coro <- unique(case_coro)
+
+#"481"     "637"     "1711-6"  "1712-1"  "1736-10" "3111"    "3112"    "3270"    "4900"  "4905"    "6036"    "6052"    "6379"    "7402" 
+
+filtered_any_persist <- df_any %>%
+  filter(case_id %in% unique_case_coro) %>%
+  select(case_id, any_persist)
+
+# View the result
+View(filtered_any_persist)
+
+View(df_coronary)
+table(df_coronary$p2_img_cd_echo_coronpath, df_coronary$Visit_Number)
+table(df_coronary$pimg_echo_coronpath_yesno, df_coronary$Visit_Number)
+table(df_coronary$coronary_persist, df_coronary$Visit_Number)
+
+table(df_myocard$p2_img_cd_echo_myocard)
+
+View(df_myocard %>% select(c("case_id", "myocard", "Visit_Number", "Time")))
+
+
+result <- df_coronary %>%
+  group_by(case_id) %>%
+  filter(Visit_Number == max(Visit_Number)) %>% # Select rows with the highest Visit_Number 
+  ungroup() %>%
+  filter(coronary == 1) %>% 
+  summarise(
+    number_of_patients = n(), # Count the number of patients meeting the condition
+    median_time = median(Time, na.rm = TRUE), # Calculate the median Time for these rows
+    lowest_time = min(Time, na.rm = TRUE), # Get the lowest Time value
+    highest_time = max(Time, na.rm = TRUE) # Get the highest Time value
+  )
+
+
+
+# View the result
+print(result)
+
+df_unique <- df %>% 
+  group_by(case_id) %>% 
+  slice(1)  # Retains the first row for each unique case_id
+
+# Perform table on Age.group for unique case_id
+table(df_unique$Age.group)
+
+
+
+df_coro_unique <- df_coronary %>% 
+  group_by(case_id) %>% 
+  slice(1) 
+
+table(df_coro_unique$coronary_persist)
+
+case_ids_with_myocard_persist <- df_myocard_unique %>%
+  filter(myocard_persist == 1) %>%
+  pull(case_id)
+
+
+###additional coronary parameters
+table(df$p2_img_cd_echo_coroneury)
+
+coro_aneurysm <- df %>%
+  group_by(case_id) %>%                                   # Group by case_id
+  filter(any(p2_img_cd_echo_coroneury == "1")) %>%        # Keep groups where any row has a 1 in p2_img_cd_echo_coroneury
+  select(case_id, Time, p2_img_cd_echo_coroneury,         # Select the desired columns
+         p2_img_cd_echo_coronpath, Visit_Number, 
+         pimg_echo_coroneury_yesno) %>%
+  ungroup()                                               # Ungroup to clean up
+
+# Display the result
+print(coro_aneurysm)
+
+cor_tab <- table(df$p2_img_cd_echo_cor_meas2)
+
+coro_size <- df %>%
+  group_by(case_id) %>%                                   # Group by case_id
+  filter(!is.na(p2_img_cd_echo_cor_meas2)) %>%            # Keep rows where p2_img_cd_echo_cor_meas2 is not NA
+  select(case_id, Time, p2_img_cd_echo_cor_meas2,         # Select the desired columns
+         p2_img_cd_echo_coronpath, Visit_Number, p2_pat_weight, p2_pat_height) %>%
+  ungroup()   
+
+write.csv(cor_tab, "Results/cor_tab.csv")
+View(df %>%
+       select(c("case_id", "p2_img_cd_echo_cor_meas2")))
+
+```
+
+
+
+
+
+
+
+```{r}
+#Check presence of symptom at 365 days and number of fully recovered at 365 days
+#View(df_any %>% select("case_id", "redcap_repeat_instance_l", "Time", "neuro"))
+
+
+
+# Filter the cases and extract their case_id
+identified_cases <- df_coronary %>%
+  filter(coronary == 1 & Time > 364) %>%
+  distinct(case_id)  # Get unique case_ids
+
+# Count the number of cases
+count <- nrow(identified_cases)
+
+# Display the count and case_id values
+cat("Number of patients with symptom == 1 and Time > 364:", count, "\n")
+
+cat("Case IDs:", paste(identified_cases$case_id, collapse = ", "), "\n")
+
+
+```
+
+
+
+#scatter plots for continuous variable
+```{r}
+#create lab markers as variables
+
+plab<- c("plab_hemoglob_si_value", "plab_thrombocyte_si_value", "plab_leukocyte_si_value", "plab_lymphocyte_si_value", "plab_crp_si_value",  "plab_ferritin_si_value", "plab_creatinin_si_value", "plab_gpt_si_value", "plab_bilirub_tot_si_value", "plab_albumin_si_value", "plab_quick_value", "plab_fibrinog_si_value", "plab_ddimere_si_value", "plab_probnp_si_value", "plab_tropon_ti_si_value", "plab_ck_mb_si_value", "plab_lipase_si_value")
+
+p2_lab <- c("p2_lab_hemoglob_si_val", "p2_lab_thrombocyte_si_val", "p2_lab_leukocyte_si_val", "p2_lab_lymphocyte_si_val",
+ "p2_lab_crp_si_val", "p2_lab_ferritin_si_val", "p2_lab_creatinin_si_val", "p2_lab_gpt_si_val", "p2_lab_bilirub_tot_si_val", "p2_lab_albumin_si_val", "p2_lab_quick_val", "p2_lab_fibrinog_si_val", "p2_lab_ddimere_si_val", "p2_lab_probnp_si_val", "p2_lab_tropon_ti_si_val", "p2_lab_ck_mb_si_val", "p2_lab_lipase_si_val")
+
+lab_names <- c("Hemoglobin", "Platelets", "Leukocytes", "Lymphocytes", "CRP", "Ferritin", "Creatinine", "ALT", "Bilirubin", "Albumin", "Prothrombin Time", "Fibrinogen", "D-dimer", "pro-BNP", "Troponin T-I", "CK-MB", "Lipase")
+
+create_lab_values <- function(df, plab_cols, p2_lab_cols, lab_names) {
+  for (i in seq_along(lab_names)) {
+    df <- df %>%
+      mutate(!!lab_names[i] := ifelse(!is.na(.[[plab_cols[i]]]), .[[plab_cols[i]]], .[[p2_lab_cols[i]]]))
+  }
+  return(df)
+}
+
+df <- create_lab_values(df, plab, p2_lab, lab_names)
+
+
+```
+
+#individual plot
+```{r}
+ggplot(df, aes(x = Time, y = df$'pro-BNP', color = factor(ICU))) +
+  geom_point(na.rm = TRUE) +  
+  geom_smooth(method = "lm", na.rm = TRUE, se = FALSE) +  
+  labs(color = "ICU") +  
+  scale_color_manual(values = c("#6495ED", "#8b0000"),  
+    labels = c("no", "yes")) +  
+  theme_minimal()+
+  scale_y_log10()+
+  labs(title= "pro-BNP",
+    x = "Days", 
+    y = "pmol/l (log10)", 
+    color = "ICU")
+
+ggsave(paste0(dir, "/Scatter_CRP.png"), width = 6, height = 3, dpi = 600)
+```
+
+#create all scatter plots
+```{r}
+lab_names <- c("Hemoglobin", "Platelets", "Leukocytes", "Lymphocytes", "CRP", "Ferritin", "Creatinine", "ALT", "Bilirubin", "Albumin", "Fibrinogen", "D-dimer", "pro-BNP", "Troponin T-I", "CK-MB", "Lipase")
+  
+y_labels <- c("mmol/l", "G/l", "G/l", "cells/µl", "mg/l", "ng/ml", "µmol/l", "U/l", "µmol/l", "g/dl", "g/l", "mg/l", "pmol/l", "ng/l", "U/l", "U/l")
+  
+comparison_titles <- c(
+    "ICU" = "ICU",
+    "Gender" = "Gender",
+    "Age.group" = "Age",
+    "BMI" = "Obesity",
+    "Kidney" = "Kidney failure",
+    "Comorb" = "Comorbidity",
+    "Compl.ther" = "Complete therapy"
+  )
+  
+legend_labels_dict <- list(
+    "ICU" = c("0" = "no", "1" = "yes"),
+    "Gender" = c("0" = "male", "1" = "female"),
+    "Age.group" = c("0" = "young", "1" = "old"),
+    "BMI" = c("0" = "no", "1" = "yes"),
+    "Kidney" = c("0" = "no", "1" = "yes"),
+    "Comorb" = c("0" = "no", "1" = "yes"),
+    "Compl.ther" = c("0" = "no", "1" = "yes")
+  )
+
+normal_ranges <- list(
+  "Hemoglobin" = (6.88 - 8.86), 
+  "Platelets" =c(150000, 400000), 
+  "Leukocytes" =c(4000, 10000), 
+  "Lymphocytes" =c(1000, 9500), 
+  "CRP"=c(3), 
+  "Ferritin"=c(7,140), 
+  "Creatinine"=c(0.2, 1.17), 
+  "ALT" =c(10,40), 
+  "Bilirubin" =c(0.2, 1.3), 
+  "Albumin"=c(2.8, 5.5), 
+  "Fibrinogen"=c(2,4), 
+  "D-dimer"=c(0.56), 
+  "pro-BNP", 
+  "Troponin T-I" =c(39), 
+  "CK-MB"=c(25), 
+  "Lipase"= c(120)
+  )
+
+```
+
+```{r}
+lab_names_vector <- setNames(lab_names, lab_names)
+y_labels_vector <- setNames(y_labels, lab_names)
+
+generate_plot <- function(df, variable, comparison) {
+  # Retrieve the lab name and y-axis label based on the variable
+  lab_name <- lab_names_vector[[variable]]
+  y_label <- y_labels_vector[[variable]]
+  
+  # Retrieve the comparison title and legend labels
+  comparison_title <- comparison_titles[[comparison]]
+  legend_labels <- legend_labels_dict[[comparison]]
+  
+  # Retrieve the normal range for the variable
+  normal_range <- normal_ranges[[variable]]
+  
+  # Generate the plot
+  p <- ggplot(df, aes(x = Time, y = .data[[variable]], color = factor(.data[[comparison]]))) +
+    geom_point(na.rm = TRUE) +
+    geom_smooth(method = "lm", na.rm = TRUE, se = FALSE) +
+    labs(color = comparison_title) +
+    scale_color_manual(values = c("#6495ED", "#8b0000"), labels = legend_labels) +
+    theme_minimal() +
+    scale_y_log10() +
+    scale_x_continuous(
+      name = "Days",          
+      breaks = seq(0, 500, 100),  
+      limits = c(0, 500)      
+    ) +
+    labs(
+      title = lab_name,
+      y = paste0(y_label, " (log10)"),
+      color = comparison_title
+    )
+  
+  # Add horizontal dashed lines for normal range if available
+  if (!is.null(normal_range)) {
+    p <- p + geom_hline(yintercept = normal_range, linetype = "dashed", color = "grey")
+  }
+  
+  return(p)
+}
+
+
+```
+
+```{r}
+
+combined_plots <- list()
+
+for (variable in lab_names) {
+  for (comparison in names(comparison_titles)) {
+    # Generate the plot
+    plot <- generate_plot(df, variable, comparison)
+    
+    # Create a key to store the plot in the list (e.g., "pro-BNP_ICU")
+    plot_name <- paste(variable, comparison, sep = "_")
+    
+    # Store the plot in the list
+    combined_plots[[plot_name]] <- plot
+  }
+}
+
+print(combined_plots[["Hemoglobin_Age.group"]])
+
+
+```
+
+#recreate plots for publication
+```{r}
+
+
+hemo_p <- ggplot(df, aes(x = Time, y = Hemoglobin, color = factor(Age.group))) +
+    geom_point(na.rm = TRUE, alpha=0.5, size=3) +
+    geom_smooth(method = "lm", na.rm = TRUE, se = FALSE) +
+    labs(
+        title = "Hemoglobin",
+        x = "Days",
+        y = "mmol/l (log10)",
+        color = "Age group" # Direct text description
+    ) +
+    scale_color_manual(
+        values = c("#6495ED", "#8b0000"),
+        labels = c("Young", "Old")
+    ) +
+    theme_minimal() +
+    scale_y_log10(limits = c(2.5, 11)) +
+    scale_x_continuous(
+        breaks = seq(0, 500, 100),
+        limits = c(0, 500)
+    )+
+  geom_hline(yintercept = c(6.83), linetype = "dashed", linewidth=1, color = "grey")
+
+# Display the plot
+hemo_p
+
+
+lympho_p <- ggplot(df, aes(x = Time, y = Lymphocytes, color = factor(Age.group))) +
+    geom_point(na.rm = TRUE, alpha=0.5, size=3) +
+    geom_smooth(method = "lm", na.rm = TRUE, se = FALSE) +
+    labs(
+        title = "Lymphocytes",
+        x = "Days",
+        y = "cells/µl (log10)",
+        color = "Age group" # Direct text description
+    ) +
+    scale_color_manual(
+        values = c("#6495ED", "#8b0000"),
+        labels = c("Young", "Old")
+    ) +
+    theme_minimal() +
+    scale_y_log10() +
+    scale_x_continuous(
+        breaks = seq(0, 500, 100),
+        limits = c(0, 500)
+    )+
+  geom_hline(yintercept = c(1000, 3000), linetype = "dashed", linewidth=1, color = "grey")
+
+# Display the plot
+lympho_p
+
+hemo_p+lympho_p+plot_layout(ncol=2)
+
+ggsave(paste0(dir, "/hemo_lympho_publication.png"), width = 10.2, height = 3, dpi = 600)
+
+```
+
+
+```{r}
+dir.lab <- "Results/lab"
+
+
+for (variable in lab_names) {
+  # Extract all plots for the current variable
+  plots_to_save <- lapply(names(combined_plots), function(key) {
+    if (startsWith(key, variable)) {
+      return(combined_plots[[key]])
+    } else {
+      return(NULL)
+    }
+  })
+  
+  # Remove any NULL entries
+  plots_to_save <- Filter(Negate(is.null), plots_to_save)
+  
+  # If there are plots to save, create the PDF
+  if (length(plots_to_save) > 0) {
+    # Combine the plots into a grid (2 columns, up to 4 rows)
+    combined_plots_grid <- plot_grid(plotlist = plots_to_save, ncol = 2, nrow = min(4, length(plots_to_save)))
+    
+    # Save the combined plot as a PDF
+    ggsave(filename = paste0(dir.lab, "/", variable, "_comparisons2.pdf"),
+           plot = combined_plots_grid, 
+           width = 210, height = 297, units = "mm")  # DIN A4 size in mm
+  }
+}
+```
+
+
+
+
+
+
+
