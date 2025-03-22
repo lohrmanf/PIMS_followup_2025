@@ -25,6 +25,7 @@ library(gridExtra)
 library(logistf)
 library(gt)
 library(patchwork)
+library(FactoMineR)
 
 dir <- "Results"
 dir.b <- "Results/Barplot"
@@ -32,25 +33,29 @@ dir.b <- "Results/Barplot"
 df<- read_csv("PIMS_BN.csv")
 ```
 
-# initial setup1
+# initial setup
 ```{r, include=FALSE}
 #import data
 PIMS_all <- fread("PIMS-Erstmeldung-und-Nachsorge-Survey-Export-RAW-20231101.CSV", sep = ";", dec = ",")
 
+
 #List of patients with follow-up
 Pat_List <- fread("Liste_PatID_mit_Nachsorge.CSV", sep = ";", dec = ",")
 
-#List of variables
-Var_List <- scan("PIMS_Auswertung_Variablen.txt", what = character())
+#select patients
+PIMS_BN <- PIMS_all[case_id %in% Pat_List$Nr_unique]
 
-#select patients and variables
-PIMS_all <- PIMS_all[case_id %in% Pat_List$Nr_unique]
-
-PIMS_BN <- PIMS_all[, ..Var_List]
-table(PIMS_BN$p2_img_cd_echo_cor_meas2)
 #change date format
 PIMS_BN[, ppatient_admission_date := lubridate::ymd(ppatient_admission_date)]
 
+#one entry has been mistakenly recorded in Dresden, confirmed by primary data curator, remove
+PIMS_BN <- PIMS_BN[!(case_id == "1711-10" & !is.na(p2_pat_appt_date) & p2_pat_appt_date == as.Date("2021-12-21"))]
+
+df_filtered <- PIMS_BN %>%
+  filter(case_id %in% "1711-10")%>%
+  select(case_id, p2_pat_appt_date)
+
+View(df_filtered)
 
 #Baseline = 0
 PIMS_BN[is.na(redcap_repeat_instance), redcap_repeat_instance := 0]
@@ -63,11 +68,9 @@ PIMS_BN[, ppatient_admission_date:= ppatient_admission_date[redcap_repeat_instan
 
 #New col with number of follow-up visits
 PIMS_BN[, max_repeat_instance := max(redcap_repeat_instance), by = case_id]
-```
 
-# initial setup2
-## Auswertung der Zeiträume zwischen stationärer Aufnahme und Nachsorge
-```{r, include=FALSE, warning=FALSE}
+# Auswertung der Zeiträume zwischen stationärer Aufnahme und Nachsorge
+
 #Calculate duration
 PIMS_BN[, admiss_appt_diff := difftime(p2_pat_appt_date, ppatient_admission_date, units="days")]
 
@@ -98,7 +101,7 @@ PIMS_BN[case_id == "1736-6" & redcap_repeat_instance == 3, p2_pat_appt_date := u
 PIMS_BN[case_id == "1736-6" & redcap_repeat_instance == 4, p2_pat_appt_date := update(p2_pat_appt_date, year= 2022, month = 1, day = 7)]
 PIMS_BN[case_id == "1736-6" & redcap_repeat_instance == 5, p2_pat_appt_date := update(p2_pat_appt_date, year= 2023, month = 1, day = 6)]
 
-#one patient without date on follow-up: 1711-7 remove or find out.
+#one patient without date on follow-up: 1711-7 remove.
 case_id_to_remove <- "1711-7"
 
 #PIMS_BN <- PIMS_BN %>%
@@ -151,20 +154,15 @@ PIMS_BN[, diff_group_f := factor(diff_group, levels = c(1:3), labels = c("<= 30 
 PIMS_BN <- PIMS_BN %>%
   mutate(Time = ifelse(is.na(admiss_appt_diff), 0, admiss_appt_diff))
 
+PIMS_BN <- PIMS_BN %>%
+  group_by(case_id) %>%
+  mutate(Time_Interval = lag(Time, default = 0)) %>%
+  mutate(Time_Interval = Time - Time_Interval) %>%
+  mutate(Visit_Number = row_number() - 1)  
+
 write.csv(PIMS_BN, file = "PIMS_BN.csv", row.names = FALSE)
 
 ```
-
-#search for variables
-```{r}
-letter_combination <- "p2_lab"
-
-# List all column names that start with the specified letter combination
-matching_columns <- grep(paste0("^", letter_combination), colnames(PIMS_all), value = TRUE)
-
-print(matching_columns)
-```
-
 
 #analysis starts here
 ```{r}
@@ -175,17 +173,22 @@ print(matching_columns)
 
 ```
 
-#Overview figures
-# 1 create Time_Interval
+#verify that all patients have at least one follow-up
 ```{r}
-df <- df %>%
+patient_follow_up_count <- df %>%
   group_by(case_id) %>%
-  mutate(Time_Interval = lag(Time, default = 0)) %>%
-  mutate(Time_Interval = Time - Time_Interval) %>%
-  mutate(Visit_Number = row_number() - 1)  
+  summarise(n_visits = n())
+
+# Find patients with only one visit (no follow-up)
+patients_without_followup <- patient_follow_up_count %>%
+  filter(n_visits == 1)
+
+# Print the result
+patients_without_followup
 ```
 
-#follow-up time with max_time
+
+#follow-up time with max_time - graph
 ```{r}
 # Prepare data for Kaplan-Meier
 df_KM <- df %>%
@@ -224,10 +227,10 @@ cat("75th percentile (Q75):", q75, "\n")
 km_plot <- ggsurvplot(km_fit, 
            conf.int = FALSE,                
            xlab = "Time (days)", 
-           ylab = "% of Patients", 
-           title = "Patients in Follow-up (n=127)", 
+           ylab = "% of patients", 
+           title = "Patients in follow-up (n=127)", 
            legend = "none",                 
-           palette = "cornflowerblue",     
+           palette = "#440154",     
            surv.scale = "percent",
            surv.median.line = "hv")     
 
@@ -237,17 +240,17 @@ km_plot$plot <- km_plot$plot +
            vjust = -1.5, color = "black", size = 4)+
   theme(
     plot.title = element_text(size = 14, face = "plain"),   
-    axis.title.x = element_text(size = 12),               
-    axis.title.y = element_text(size = 12),               
+    axis.title.x = element_text(size = 10),               
+    axis.title.y = element_text(size = 10),               
     axis.text.x = element_text(size = 10),                
     axis.text.y = element_text(size = 10)                 
   )
 
-ggsave(paste0(dir, "/Followup.png"), width=4, height =3, dpi=600)
+ggsave(paste0(dir, "/Followup.png"), width=5, height =3, dpi=600)
 ```
 
 
-#follow-up intervals
+#follow-up intervals - graph
 ```{r}
 
 df_filtered <- df %>%
@@ -258,37 +261,23 @@ counts <- df_filtered %>%
   summarize(n = n())
 
 ggplot(df_filtered, aes(x = as.factor(Visit_Number), y = Time_Interval)) +
-  geom_violin(trim = FALSE, color = "cornflowerblue") +
+  geom_violin(trim = FALSE, color = "#440154") +
   geom_text(data = counts, aes(x = as.factor(Visit_Number), y = max(df_filtered$Time_Interval) + 5, label = paste("n =", n)), 
             vjust = 0, size = 4) +  
-  labs(title = "Intervals Between Visits", 
-       x = "Visit Number", 
-       y = "Time Interval (days)") +
+  labs(title = "Intervals between visits", 
+       x = "Visit number", 
+       y = "Time interval (days)") +
   theme_minimal() +
   scale_y_continuous(limits = c(0, NA))+
   theme(
     plot.title = element_text(size = 14, face = "plain"),   
-    axis.title.x = element_text(size = 12),               
-    axis.title.y = element_text(size = 12),               
+    axis.title.x = element_text(size = 10),               
+    axis.title.y = element_text(size = 10),               
     axis.text.x = element_text(size = 10),                
     axis.text.y = element_text(size = 10)                 
   )
 
-ggsave(paste0(dir, "/Intervals.png"), width=4, height =3, dpi=600)
-```
-
-#verify that all patients have at least one follow-up
-```{r}
-patient_follow_up_count <- df %>%
-  group_by(case_id) %>%
-  summarise(n_visits = n())
-
-# Find patients with only one visit (no follow-up)
-patients_without_followup <- patient_follow_up_count %>%
-  filter(n_visits == 1)
-
-# Print the result
-patients_without_followup
+ggsave(paste0(dir, "/Intervals.png"), width=5, height =3, dpi=600)
 ```
 
 
@@ -332,9 +321,64 @@ df <- df %>%
   group_by(case_id) %>% 
   mutate(Compl.ther = ifelse(first(pther_immun_mod_type___2) == 1 & first(pther_immun_mod_type___13) ==1, 1, 0))%>%  
   ungroup()
+
+df <- df %>%
+  group_by(case_id) %>% 
+  mutate(Resp.supp = ifelse(first(pther_pulmo_type___3 == 1), 1, 0))%>%  
+  ungroup()
+
+df <- df %>%
+  group_by(case_id) %>% 
+  mutate(Circ.supp = ifelse(first(p1_thr_pims_list___3 == 1), 1, 0))%>%  
+  ungroup()
+
+
+
 ```
 
 
+#create number of symptoms as a continuous variable
+```{r}
+p1_cols <- paste0("p1_sy_sympt_type___", 1:14)
+p2_cols <- paste0("p2_sy_sympt_type___", 1:14)
+
+# Add the "number_of_symptoms" column
+df <- df %>%
+  mutate(number_symptoms = rowSums(select(., all_of(c(p1_cols, p2_cols))) == 1, na.rm = TRUE)) %>%
+  group_by(case_id) %>%
+  mutate(number_symptoms_admission = first(number_symptoms)) %>%
+  ungroup()
+
+df_filtered <- df %>%
+  select(case_id, Time, Visit_Number, number_symptoms, number_symptoms_admission, starts_with(c("p1_sy_sympt_type___", "p2_sy_sympt_type___")))
+
+```
+
+
+#plot number of symptoms - graph
+```{r}
+# Summarize the data: count number of patients for each combination of Visit_Number and number_of_symptoms
+df_summary <- df %>%
+  group_by(Visit_Number, number_symptoms) %>%
+  summarise(patient_count = n(), .groups = "drop")
+
+ggplot(df_summary, aes(x = as.factor(Visit_Number), y = patient_count, fill = as.factor(number_symptoms))) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_viridis_d(option = "D", direction = 1) +  # Alternatively, use scale_fill_brewer(palette = "RdYlBu")
+  labs(x = "Visit number", y = "Number of patients", fill = "Affected\norgan systems") +  
+  geom_text(aes(label = ifelse(patient_count %in% c(1, 2), "", patient_count), 
+                group = number_symptoms,
+                color = ifelse(Visit_Number == 0, "black", "white")),  
+            position = position_stack(vjust = 0.5),  
+            size = 4, fontface = "plain") +  
+  scale_color_identity() +  
+  theme_minimal()
+
+
+ggsave(paste0(dir, "/bar_Number of symptoms.png"), dpi = 600, width = 5, height = 6.1)
+
+
+```
 
 # categorical variable
 #filter for patients with symptom present during initial stay and on at least one follow-up
@@ -515,10 +559,6 @@ df_any <- df_any %>%
 
 dim(df_any)
 
-View(df_any   %>% select(c("case_id", "Visit_Number", "any_p2_1", "any_persist", "p2_sy_sympt_type___1",  "p2_sy_sympt_type___2",  "p2_sy_sympt_type___3",  "p2_sy_sympt_type___4", 
- "p2_sy_sympt_type___5",  "p2_sy_sympt_type___6",  "p2_sy_sympt_type___7",  "p2_sy_sympt_type___8", "p2_sy_sympt_type___9",  "p2_sy_sympt_type___10", "p2_sy_sympt_type___11", "p2_sy_sympt_type___12",
-"p2_sy_sympt_type___13", "p2_sy_sympt_type___14")))
-
 
 #create any echo col
 
@@ -568,15 +608,42 @@ df_echo <- df_echo %>%
     )
   )
 
-
-dim(df_echo)
-table(df_echo$echo)
-table(df_echo$echo_mod)
-
 #View(df_echo   %>% select(c("case_id", "Visit_Number", "echo", "echo_mod", "echo_persist")))
 
 
+#cardiac MRI
+df_lge <- df %>%
+  group_by(case_id) %>%
+  filter(any(p2_img_cd_crmi_lge %in% c(0, 1))) %>%
+  ungroup()
+
+
+df_lge <- df_lge %>%
+  mutate(lge = p2_img_cd_crmi_lge)
+
+#arrythmias
+df_ecg <- df %>%
+  group_by(case_id) %>%
+  filter(any(p2_img_cd_ekg_arrhyth %in% c(0, 1))) %>%
+  ungroup()
+
+df_ecg <- df_ecg %>%
+  mutate(ecg = na_if(p2_img_cd_ekg_arrhyth, -99))
+
+
+#lufu
+df_lufu <- df %>%
+  group_by(case_id) %>%
+  filter(any(p2_img_rp_lung_func %in% c(0, 1))) %>%
+  ungroup()
+
+df_lufu <- df_lufu %>%
+  mutate(lufu = na_if(p2_img_rp_lung_func, -99))
+
+table(df_lufu$lufu)
+
 ```
+
 
 #plot bar chart
 ```{r}
@@ -587,7 +654,7 @@ custom_labels <- list(
   Gender = c("0" = "Male", "1" = "Female"),
   ICU = c("0" = "No ICU", "1" = "ICU"),
   Comorb = c("0" = "No comorbidity", "1" = "Comorbidity"),
-  Age.group = c("0" = "Young", "1" = "Old"),
+  Age.group = c("0" = "≤5 years", "1" = ">5 years"),
   Compl.ther = c("0" = "Incomplete therapy", "1" = "Complete therapy")
 )
 ```
@@ -725,71 +792,182 @@ ggplot(plot_any, aes(x = factor(Visit_Number), y = count,
 # Save plot
 ggsave(paste0(dir.b, "/bar_any_", group_var, ".png"), dpi = 600, width = 5, height = 3)
 
+
+#Neuro symptom
+plot_neuro <- df_neuro %>% 
+  filter(!is.na(neuro)) %>% 
+  group_by(Visit_Number, .data[[group_var]], neuro) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+ggplot(plot_neuro, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(neuro, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  facet_wrap(as.formula(paste("~", group_var)), 
+             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
+  labs(x = "Visit number", y = "Number of patients", fill = "Neuromuscular \nsymptoms") +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 12, face = "plain"))
+
+# Save plot
+ggsave(paste0(dir.b, "/bar_neuro_", group_var, ".png"), dpi = 600, width = 5, height = 3)
+
+
 ```
 
 #plot final selection including layout
 ```{r}
-#clinical with linear regression
-#Any symptom
 
-group_var <- "ICU" 
+group_var <- "ICU"
+
+# Identify the last visit for each patient and whether they have '1' in 'any_p2_1'
+lost_to_follow_up <- df_any %>%
+  filter(!is.na(any_p2_1)) %>%
+  group_by(case_id) %>%
+  mutate(last_visit = max(Visit_Number)) %>%  # Identify the last visit for each patient
+  filter(Visit_Number == last_visit) %>%  # Filter for only the last visit per patient
+  filter(any_p2_1 == 1) %>%  # Only include patients with any_p2_1 == 1
+  group_by(Visit_Number, .data[[group_var]]) %>%  # Group by both Visit_Number and the group_var (e.g., ICU)
+  summarise(lost_count = n(), .groups = "drop")  # Count those patients at each visit
 
 plot_any <- df_any %>% 
   filter(!is.na(any_p2_1)) %>% 
   group_by(Visit_Number, .data[[group_var]], any_p2_1) %>% 
   summarise(count = n(), .groups = "drop") 
 
-# Generate plot
-any_plot <- ggplot(plot_any, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(any_p2_1, labels = c("No", "Yes")))) +
+# Join the lost_to_follow_up data with plot_any to retain necessary variables
+plot_any_with_lost <- plot_any %>%
+  left_join(lost_to_follow_up, by = c("Visit_Number", group_var))
+
+# Generate plot with manually added "Lost to follow-up" text
+any_plot <- ggplot(plot_any_with_lost, aes(x = factor(Visit_Number), y = count, 
+                                           fill = factor(any_p2_1, labels = c("No", "Yes")))) +
   geom_bar(stat = "identity", position = "stack") +
   geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
   scale_fill_manual(values = c("cornflowerblue", "brown")) +
   facet_wrap(as.formula(paste("~", group_var)), 
              labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
   labs(x = "Visit number", y = "Number of patients", fill = "Any \nsymptoms") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "plain")) +
+  # Add the lost-to-follow-up counts at a constant y level
+  geom_text(data = plot_any_with_lost %>% filter(!is.na(lost_count)),
+            aes(x = factor(Visit_Number), y = 76*1.2, label = lost_count),  
+            color = "darkgreen", fontface = "plain", size = 4, vjust = 1) +
+  geom_text(data = plot_any_with_lost %>% 
+              filter(ICU == "1"),  
+            aes(x = "6", y = 76*1.05, label = "Lost to follow-up"),  
+            color = "darkgreen", size = 4, fontface = "plain", hjust = 1)
 
-#general
+# Display the plot
+print(any_plot)
+
+```
+
+
+```{r}
+# Identify the last visit for each patient and whether they have '1' in 'general'
+lost_to_follow_up_general <- df_general %>%
+  filter(!is.na(general)) %>%  # Make sure general is not NA
+  group_by(case_id) %>%
+  mutate(last_visit = max(Visit_Number)) %>%  # Identify the last visit for each patient
+  filter(Visit_Number == last_visit) %>%  # Filter for only the last visit per patient
+  filter(general == 1) %>%  # Only include patients with general == 1
+  group_by(Visit_Number, .data[[group_var]]) %>%  # Group by both Visit_Number and the group_var (e.g., ICU)
+  summarise(lost_count = n(), .groups = "drop")  # Count those patients at each visit
+
+# General plot data processing
 plot_general <- df_general %>% 
   filter(!is.na(general)) %>% 
   group_by(Visit_Number, .data[[group_var]], general) %>% 
   summarise(count = n(), .groups = "drop") 
 
-# Generate plot
-general_plot <- ggplot(plot_general, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(general, labels = c("No", "Yes")))) +
+# Join the lost_to_follow_up_general data with plot_general
+plot_general_with_lost <- plot_general %>%
+  left_join(lost_to_follow_up_general, by = c("Visit_Number", group_var))
+
+# Generate the general plot with manually added "Lost to follow-up" text
+general_plot <- ggplot(plot_general_with_lost, aes(x = factor(Visit_Number), y = count, 
+                                                   fill = factor(general, labels = c("No", "Yes")))) +
   geom_bar(stat = "identity", position = "stack") +
   geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
   scale_fill_manual(values = c("cornflowerblue", "brown")) +
   facet_wrap(as.formula(paste("~", group_var)), 
              labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
   labs(x = "Visit number", y = "Number of patients", fill = "General \nsymptoms") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "plain")) +
+  # Add the lost-to-follow-up counts at a constant y level
+  geom_text(data = plot_general_with_lost %>% filter(!is.na(lost_count)),
+            aes(x = factor(Visit_Number), y = 76*1.2, label = lost_count),  
+            color = "darkgreen", fontface = "plain", size = 4, vjust = 1) +
+  # Add "Lost to follow-up" text once
+  geom_text(data = plot_general_with_lost %>% 
+              filter(ICU == "1"),  
+            aes(x = "6", y = 76*1.05, label = "Lost to follow-up"),  
+            color = "darkgreen", size = 4, fontface = "plain", hjust = 1)
 
-#cardio
+# Display the plot
+print(general_plot)
 
-group_var <- "Age.group" 
 
+
+```
+
+
+```{r}
+group_var <- "Age.group"
+
+# Identify the last visit for each patient and whether they have '1' in 'cardio'
+lost_to_follow_up_cardio <- df_cardio %>%
+  filter(!is.na(cardio)) %>%  # Make sure cardio is not NA
+  group_by(case_id) %>%
+  mutate(last_visit = max(Visit_Number)) %>%  # Identify the last visit for each patient
+  filter(Visit_Number == last_visit) %>%  # Filter for only the last visit per patient
+  filter(cardio == 1) %>%  # Only include patients with cardio == 1
+  group_by(Visit_Number, .data[[group_var]]) %>%  # Group by both Visit_Number and the group_var (e.g., Age.group)
+  summarise(lost_count = n(), .groups = "drop")  # Count those patients at each visit
+
+# Cardio plot data processing
 plot_cardio <- df_cardio %>% 
   filter(!is.na(cardio)) %>% 
   group_by(Visit_Number, .data[[group_var]], cardio) %>% 
-  summarise(count = n(), .groups = "drop")
+  summarise(count = n(), .groups = "drop") 
 
-# Generate plot
-cardio_plot <- ggplot(plot_cardio, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(cardio, labels = c("No", "Yes")))) +
+# Join the lost_to_follow_up_cardio data with plot_cardio
+plot_cardio_with_lost <- plot_cardio %>%
+  left_join(lost_to_follow_up_cardio, by = c("Visit_Number", group_var))
+
+# Generate the cardio plot with manually added "Lost to follow-up" text
+cardio_plot <- ggplot(plot_cardio_with_lost, aes(x = factor(Visit_Number), y = count, 
+                                                 fill = factor(cardio, labels = c("No", "Yes")))) +
   geom_bar(stat = "identity", position = "stack") +
   geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
   scale_fill_manual(values = c("cornflowerblue", "brown")) +
   facet_wrap(as.formula(paste("~", group_var)), 
              labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
   labs(x = "Visit number", y = "Number of patients", fill = "Cardiovascular \nsymptoms") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "plain")) +
+  # Add the lost-to-follow-up counts at a constant y level
+  geom_text(data = plot_cardio_with_lost %>% filter(!is.na(lost_count)),
+            aes(x = factor(Visit_Number), y = 63*1.2, label = lost_count),  
+            color = "darkgreen", fontface = "plain", size = 4, vjust = 1) +
+  # Add "Lost to follow-up" text once, placed below the right-most facet
+  geom_text(data = plot_cardio_with_lost %>% 
+              filter(Age.group == "1"),  
+            aes(x = "6", y = 63*1.05, label = "Lost to follow-up"),  
+            color = "darkgreen", size = 4, fontface = "plain", hjust = 1)
 
+# Display the plot
+print(cardio_plot)
+
+```
+
+
+```{r}
 any_plot+general_plot+cardio_plot+plot_layout(ncol=1)
 
 # Save plot
@@ -800,37 +978,92 @@ ggsave(paste0(dir, "/bar_selection_with_model.png"), dpi = 600, width = 5, heigh
 #clinical without comparison
 
 # Skin
+# Identify the last visit for each patient and whether they have '1' in 'skin'
+lost_to_follow_up_skin <- df_skin %>%
+  filter(!is.na(skin)) %>%  # Make sure skin is not NA
+  group_by(case_id) %>%
+  mutate(last_visit = max(Visit_Number)) %>%  # Identify the last visit for each patient
+  filter(Visit_Number == last_visit) %>%  # Filter for only the last visit per patient
+  filter(skin == 1) %>%  # Only include patients with skin == 1
+  group_by(Visit_Number) %>%  # Group by Visit_Number
+  summarise(lost_count = n(), .groups = "drop")  # Count those patients at each visit
+
+# Skin plot data processing
 plot_skin <- df_skin %>% 
   filter(!is.na(skin)) %>% 
   group_by(Visit_Number, skin) %>% 
   summarise(count = n(), .groups = "drop") 
 
-# Generate plot
-skin_plot <- ggplot(plot_skin, aes(x = factor(Visit_Number), y = count, 
-                      fill = factor(skin, labels = c("No", "Yes")))) +
+# Join the lost_to_follow_up_skin data with plot_skin
+plot_skin_with_lost <- plot_skin %>%
+  left_join(lost_to_follow_up_skin, by = "Visit_Number")
+
+# Generate the skin plot with manually added "Lost to follow-up" text
+skin_plot <- ggplot(plot_skin_with_lost, aes(x = factor(Visit_Number), y = count, 
+                                             fill = factor(skin, labels = c("No", "Yes")))) +
   geom_bar(stat = "identity", position = "stack") +
   geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
   scale_fill_manual(values = c("cornflowerblue", "brown")) +
   labs(x = "Visit number", y = "Number of patients", fill = "Dermatologic \nsymptoms") +
-  theme_minimal()
+  theme_minimal() +
+  # Add the lost-to-follow-up counts at a constant y level
+  geom_text(data = plot_skin_with_lost %>% filter(!is.na(lost_count)),
+            aes(x = factor(Visit_Number), y = 75*1.2, label = lost_count),  
+            color = "darkgreen", fontface = "plain", size = 4, vjust = 1) +
+  # Add "Lost to follow-up" text once, placed below the plot
+  geom_text(aes(x = "6", y = 75*1.05, label = "Lost to follow-up"), 
+            color = "darkgreen", size = 4, fontface = "plain", hjust = 1)
+
+# Display the plot
+print(skin_plot)
+```
 
 
-# Gastro
+```{r}
+# Identify the last visit for each patient and whether they have '1' in 'gastro'
+lost_to_follow_up_gastro <- df_gastro %>%
+  filter(!is.na(gastro)) %>%  # Make sure gastro is not NA
+  group_by(case_id) %>%
+  mutate(last_visit = max(Visit_Number)) %>%  # Identify the last visit for each patient
+  filter(Visit_Number == last_visit) %>%  # Filter for only the last visit per patient
+  filter(gastro == 1) %>%  # Only include patients with gastro == 1
+  group_by(Visit_Number) %>%  # Group by Visit_Number
+  summarise(lost_count = n(), .groups = "drop")  # Count those patients at each visit
+
+# Gastro plot data processing
 plot_gastro <- df_gastro %>% 
   filter(!is.na(gastro)) %>% 
   group_by(Visit_Number, gastro) %>% 
   summarise(count = n(), .groups = "drop") 
 
-# Generate plot
-gastro_plot <- ggplot(plot_gastro, aes(x = factor(Visit_Number), y = count, 
-                        fill = factor(gastro, labels = c("No", "Yes")))) +
+# Join the lost_to_follow_up_gastro data with plot_gastro
+plot_gastro_with_lost <- plot_gastro %>%
+  left_join(lost_to_follow_up_gastro, by = "Visit_Number")
+
+# Generate the gastro plot with manually added "Lost to follow-up" text
+gastro_plot <- ggplot(plot_gastro_with_lost, aes(x = factor(Visit_Number), y = count, 
+                                                 fill = factor(gastro, labels = c("No", "Yes")))) +
   geom_bar(stat = "identity", position = "stack") +
   geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
   scale_fill_manual(values = c("cornflowerblue", "brown")) +
   labs(x = "Visit number", y = "Number of patients", fill = "Gastrointestinal \nsymptoms") +
-  theme_minimal()
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "plain")) +
+  # Add the lost-to-follow-up counts at a constant y level
+  geom_text(data = plot_gastro_with_lost %>% filter(!is.na(lost_count)),
+            aes(x = factor(Visit_Number), y = 112*1.2, label = lost_count),  
+            color = "darkgreen", fontface = "plain", size = 4, vjust = 1) +
+  # Add "Lost to follow-up" text once, placed below the plot
+  geom_text(aes(x = "6", y = 112*1.05, label = "Lost to follow-up"), 
+            color = "darkgreen", size = 4, fontface = "plain", hjust = 1)
+
+# Display the plot
+print(gastro_plot)
+
+```
 
 
+```{r}
 # Musculoskeletal
 plot_musculo <- df_musculo %>% 
   filter(!is.na(musculo)) %>% 
@@ -846,7 +1079,14 @@ musculo_plot <- ggplot(plot_musculo, aes(x = factor(Visit_Number), y = count,
   labs(x = "Visit number", y = "Number of patients", fill = "Musculoskeletal \nsymptoms") +
   theme_minimal()
 
+# Display the plot
+print(musculo_plot)
 
+
+```
+
+
+```{r}
 skin_plot+gastro_plot+musculo_plot+plot_layout(ncol=3)
 
 # Save plot
@@ -859,65 +1099,147 @@ ggsave(paste0(dir, "/bar_clin_no_comparison.png"), dpi = 600, width = 10.2, heig
 #### Echo results
 group_var <- "Age.group"  
 
-#echo
+# Identify the last visit for each patient and whether they have '1' in 'echo_mod'
+lost_to_follow_up_echo <- df_echo %>%
+  filter(!is.na(echo_mod)) %>%  # Make sure echo_mod is not NA
+  group_by(case_id) %>%
+  mutate(last_visit = max(Visit_Number)) %>%  # Identify the last visit for each patient
+  filter(Visit_Number == last_visit) %>%  # Filter for only the last visit per patient
+  filter(echo_mod == 1) %>%  # Only include patients with echo_mod == 1
+  group_by(Visit_Number, .data[[group_var]]) %>%  # Group by Visit_Number and group_var (Age.group)
+  summarise(lost_count = n(), .groups = "drop")  # Count those patients at each visit
+
+# Echo plot data processing
 plot_echo <- df_echo %>% 
   filter(!is.na(echo_mod)) %>% 
   group_by(Visit_Number, .data[[group_var]], echo_mod) %>% 
   summarise(count = n(), .groups = "drop") 
 
-# Generate plot
-echo_plot <- ggplot(plot_echo, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(echo_mod, labels = c("No", "Yes")))) +
+# Join the lost_to_follow_up_echo data with plot_echo
+plot_echo_with_lost <- plot_echo %>%
+  left_join(lost_to_follow_up_echo, by = c("Visit_Number", group_var))
+
+# Generate the echo plot with manually added "Lost to follow-up" text
+echo_plot <- ggplot(plot_echo_with_lost, aes(x = factor(Visit_Number), y = count, 
+                                             fill = factor(echo_mod, labels = c("No", "Yes")))) +
   geom_bar(stat = "identity", position = "stack") +
   geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
   scale_fill_manual(values = c("cornflowerblue", "brown")) +
   facet_wrap(as.formula(paste("~", group_var)), 
              labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
   labs(x = "Visit number", y = "Number of patients", fill = "Echocardiographic \nabnormality") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "plain")) +
+  # Add the lost-to-follow-up counts at a constant y level
+  geom_text(data = plot_echo_with_lost %>% filter(!is.na(lost_count)),
+            aes(x = factor(Visit_Number), y = 48*1.2, label = lost_count),  
+            color = "darkgreen", fontface = "plain", size = 4, vjust = 1) +
+  # Add "Lost to follow-up" text once
+  geom_text(data = plot_echo_with_lost %>% 
+              filter(Age.group == "1"),  
+            aes(x = "6", y = 48*1.05, label = "Lost to follow-up"),  
+            color = "darkgreen", size = 4, fontface = "plain", hjust = 1)
+
+# Display the plot
+print(echo_plot)
 
 
 
-#myocard
+
+# Identify the last visit for each patient and whether they have '1' in 'myocard_mod'
+lost_to_follow_up_myocard <- df_myocard %>%
+  filter(!is.na(myocard_mod)) %>%  # Make sure myocard_mod is not NA
+  group_by(case_id) %>%
+  mutate(last_visit = max(Visit_Number)) %>%  # Identify the last visit for each patient
+  filter(Visit_Number == last_visit) %>%  # Filter for only the last visit per patient
+  filter(myocard_mod == 1) %>%  # Only include patients with myocard_mod == 1
+  group_by(Visit_Number, .data[[group_var]]) %>%  # Group by Visit_Number and group_var (Age.group)
+  summarise(lost_count = n(), .groups = "drop")  # Count those patients at each visit
+
+# Myocardial plot data processing
 plot_myocard <- df_myocard %>% 
   filter(!is.na(myocard_mod)) %>% 
   group_by(Visit_Number, .data[[group_var]], myocard_mod) %>% 
   summarise(count = n(), .groups = "drop") 
 
-# Generate plot
-myocard_plot <- ggplot(plot_myocard, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(myocard_mod, labels = c("No", "Yes")))) +
+# Join the lost_to_follow_up_myocard data with plot_myocard
+plot_myocard_with_lost <- plot_myocard %>%
+  left_join(lost_to_follow_up_myocard, by = c("Visit_Number", group_var))
+
+# Generate the myocardial plot with manually added "Lost to follow-up" text
+myocard_plot <- ggplot(plot_myocard_with_lost, aes(x = factor(Visit_Number), y = count, 
+                                                   fill = factor(myocard_mod, labels = c("No", "Yes")))) +
   geom_bar(stat = "identity", position = "stack") +
   geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
   scale_fill_manual(values = c("cornflowerblue", "brown")) +
   facet_wrap(as.formula(paste("~", group_var)), 
              labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
   labs(x = "Visit number", y = "Number of patients", fill = "Myocardial \ndysfunction") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "plain")) +
+  # Add the lost-to-follow-up counts at a constant y level
+  geom_text(data = plot_myocard_with_lost %>% filter(!is.na(lost_count)),
+            aes(x = factor(Visit_Number), y = 33*1.2, label = lost_count),  
+            color = "darkgreen", fontface = "plain", size = 4, vjust = 1) +
+  # Add "Lost to follow-up" text once
+  geom_text(data = plot_myocard_with_lost %>% 
+              filter(Age.group == "1"),  
+            aes(x = "6", y = 33*1.05, label = "Lost to follow-up"),  
+            color = "darkgreen", size = 4, fontface = "plain", hjust = 1)
+
+# Display the plot
+print(myocard_plot)
 
 
 
-#coronary
+# Identify the last visit for each patient and whether they have '1' in 'coronary_mod'
+lost_to_follow_up_coronary <- df_coronary %>%
+  filter(!is.na(coronary_mod)) %>%  # Make sure coronary_mod is not NA
+  group_by(case_id) %>%
+  mutate(last_visit = max(Visit_Number)) %>%  # Identify the last visit for each patient
+  filter(Visit_Number == last_visit) %>%  # Filter for only the last visit per patient
+  filter(coronary_mod == 1) %>%  # Only include patients with coronary_mod == 1
+  group_by(Visit_Number, .data[[group_var]]) %>%  # Group by Visit_Number and group_var (Age.group)
+  summarise(lost_count = n(), .groups = "drop")  # Count those patients at each visit
+
+# Coronary plot data processing
 plot_coronary <- df_coronary %>% 
   filter(!is.na(coronary_mod)) %>% 
   group_by(Visit_Number, .data[[group_var]], coronary_mod) %>% 
   summarise(count = n(), .groups = "drop") 
 
-# Generate plot
-coro_plot <-ggplot(plot_coronary, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(coronary_mod, labels = c("No", "Yes")))) +
+# Join the lost_to_follow_up_coronary data with plot_coronary
+plot_coronary_with_lost <- plot_coronary %>%
+  left_join(lost_to_follow_up_coronary, by = c("Visit_Number", group_var))
+
+# Generate the coronary plot with manually added "Lost to follow-up" text
+coro_plot <- ggplot(plot_coronary_with_lost, aes(x = factor(Visit_Number), y = count, 
+                                                 fill = factor(coronary_mod, labels = c("No", "Yes")))) +
   geom_bar(stat = "identity", position = "stack") +
   geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
   scale_fill_manual(values = c("cornflowerblue", "brown")) +
   facet_wrap(as.formula(paste("~", group_var)), 
              labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
   labs(x = "Visit number", y = "Number of patients", fill = "Coronary \ndilatation") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "plain")) +
+  # Add the lost-to-follow-up counts at a constant y level
+  geom_text(data = plot_coronary_with_lost %>% filter(!is.na(lost_count)),
+            aes(x = factor(Visit_Number), y = 22*1.2, label = lost_count),  
+            color = "darkgreen", fontface = "plain", size = 4, vjust = 1) +
+  # Add "Lost to follow-up" text once, placed below the plot
+  geom_text(data = plot_coronary_with_lost %>% 
+              filter(Age.group == "1"),  
+            aes(x = "6", y = 22*1.05, label = "Lost to follow-up"),  
+            color = "darkgreen", size = 4, fontface = "plain", hjust = 1)
+
+# Display the plot
+print(coro_plot)
+
+```
 
 
+```{r}
 layout <- paste0(
   "A#\n",
   "BC"
@@ -928,6 +1250,124 @@ echo_plot + myocard_plot + coro_plot +
 
 # Save plot
 ggsave(paste0(dir, "/bar_echo_combined_", group_var, ".png"), dpi = 600, width = 10.2, height = 6.1)
+```
+
+#functional diagnostics
+```{r}
+# Arrhythmias
+plot_ecg <- df_ecg %>% 
+  filter(!is.na(ecg)) %>% 
+  group_by(Visit_Number, ecg) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Generate plot
+ecg_plot <- ggplot(plot_ecg, aes(x = factor(Visit_Number), y = count, 
+                         fill = factor(ecg, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  labs(x = "Visit number", y = "Number of patients", fill = "Arrhythmias") +
+  theme_minimal()
+
+# Display the plot
+print(ecg_plot)
+
+
+#lge
+#without group_var
+
+# Identify the last visit for each patient and whether they have '1'
+lost_to_follow_up_lge <- df_lge %>%
+  filter(!is.na(lge)) %>%  
+  group_by(case_id) %>%
+  mutate(last_visit = max(Visit_Number)) %>%  # Identify the last visit for each patient
+  filter(Visit_Number == last_visit) %>%  # Filter for only the last visit per patient
+  filter(lge == 1) %>%  # Only include patients with  == 1
+  group_by(Visit_Number) %>%  # Group by Visit_Number
+  summarise(lost_count = n(), .groups = "drop")  # Count those patients at each visit
+
+#  plot data processing
+plot_lge <- df_lge %>% 
+  filter(!is.na(lge)) %>% 
+  group_by(Visit_Number, lge) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Join 
+plot_lge_with_lost <- plot_lge %>%
+  left_join(lost_to_follow_up_lge, by = "Visit_Number")
+
+# Generate the  plot with manually added "Lost to follow-up" text
+lge_plot <- ggplot(plot_lge_with_lost, aes(x = factor(Visit_Number), y = count, 
+                                                 fill = factor(lge, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  labs(x = "Visit number", y = "Number of patients", fill = "Late gadolinium \nenhancement") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "plain")) +
+  # Add the lost-to-follow-up counts at a constant y level
+  geom_text(data = plot_lge_with_lost %>% filter(!is.na(lost_count)),
+            aes(x = factor(Visit_Number), y = 9*1.2, label = lost_count),  
+            color = "darkgreen", fontface = "plain", size = 4, vjust = 1) +
+  # Add "Lost to follow-up" text 
+  geom_text(aes(x = "6", y = 9*1.05, label = "Lost to follow-up"), 
+            color = "darkgreen", size = 4, fontface = "plain", hjust = 1)
+
+# Display the plot
+print(lge_plot)
+
+
+
+#lufu
+#without group_var
+
+# Identify the last visit for each patient and whether they have '1'
+lost_to_follow_up_lufu <- df_lufu %>%
+  filter(!is.na(lufu)) %>%  
+  group_by(case_id) %>%
+  mutate(last_visit = max(Visit_Number)) %>%  # Identify the last visit for each patient
+  filter(Visit_Number == last_visit) %>%  # Filter for only the last visit per patient
+  filter(lufu == 1) %>%  # Only include patients with  == 1
+  group_by(Visit_Number) %>%  # Group by Visit_Number
+  summarise(lost_count = n(), .groups = "drop")  # Count those patients at each visit
+
+#  plot data processing
+plot_lufu <- df_lufu %>% 
+  filter(!is.na(lufu)) %>% 
+  group_by(Visit_Number, lufu) %>% 
+  summarise(count = n(), .groups = "drop") 
+
+# Join 
+plot_lufu_with_lost <- plot_lufu %>%
+  left_join(lost_to_follow_up_lufu, by = "Visit_Number")
+
+# Generate the  plot with manually added "Lost to follow-up" text
+lufu_plot <- ggplot(plot_lufu_with_lost, aes(x = factor(Visit_Number), y = count, 
+                                                 fill = factor(lufu, labels = c("No", "Yes")))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("cornflowerblue", "brown")) +
+  labs(x = "Visit number", y = "Number of patients", fill = "Abnormal \npulmonary \nfunction") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "plain")) +
+  # Add the lost-to-follow-up counts at a constant y level
+  geom_text(data = plot_lufu_with_lost %>% filter(!is.na(lost_count)),
+            aes(x = factor(Visit_Number), y = 11*1.2, label = lost_count),  
+            color = "darkgreen", fontface = "plain", size = 4, vjust = 1) +
+  # Add "Lost to follow-up" text 
+  geom_text(aes(x = "3", y = 11*1.05, label = "Lost to follow-up"), 
+            color = "darkgreen", size = 4, fontface = "plain", hjust = 1)
+
+# Display the plot
+print(lufu_plot)
+
+ecg_plot+lge_plot+lufu_plot+plot_layout(ncol=3)
+
+# Save plot
+ggsave(paste0(dir, "/bar_functional_diag.png"), dpi = 600, width = 10.2, height = 3)
+
+
+
 ```
 
 
@@ -968,6 +1408,51 @@ summary(model_coro)
 
 #models to keep and clean
 ```{r}
+variables <- "ICU + ppatient_age_years + Gender + Comorb + number_symptoms_admission"
+
+
+
+#pooled variables
+
+```
+
+
+#explore best model for cardio_persist
+```{r}
+# Define the list of variables
+variables <- c("ICU", "ppatient_age_years", "Gender", "Comorb", "clinical_group", "Resp.supp", "Circ.supp", "number_symptoms_admission")
+
+# Generate all possible combinations of the variables
+combinations <- unlist(lapply(1:length(variables), function(x) combn(variables, x, simplify = FALSE)), recursive = FALSE)
+
+# Initialize a variable to store the best model and its AIC
+best_model <- NULL
+best_aic <- Inf
+
+# Loop over each combination of variables, fit the model, and compare AIC
+for (combo in combinations) {
+  # Create the formula for the current combination
+  formula <- as.formula(paste("echo_persist ~", paste(combo, collapse = " + ")))
+  
+  # Fit the model
+  model <- glm(formula, data = df_echo_model, family = binomial(link = "logit"))
+  
+  # Compare AIC and keep the best model
+  if (model$aic < best_aic) {
+    best_aic <- model$aic
+    best_model <- model
+  }
+}
+
+# Print the summary of the best model
+summary(best_model)
+
+
+```
+
+
+
+```{r}
 #cardio
 
 #condense into one line per patient
@@ -976,9 +1461,9 @@ df_cardio_model <- df_cardio %>%
   slice(1) %>%
   ungroup()
 
-View(df_cardio_model %>% select(c("case_id", "cardio_persist", "ICU", "Gender", "ppatient_age_years", "ppatient_bmi", "Comorb")))
+formula <- as.formula(paste("cardio_persist ~", variables))
 
-model_cardio <- glm(cardio_persist ~ ICU + ppatient_age_years + Gender  + Comorb, data = df_cardio_model, family = binomial(link = "logit"))
+model_cardio <- glm(formula,  data = df_cardio_model, family = binomial(link = "logit"))
 
 summary(model_cardio)
 
@@ -986,7 +1471,7 @@ summary(model_cardio)
 
 #clean up the result table of the model
 
-rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)")
+rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)", "N° affected organ systems")
 
 model_cardio_df<- as.data.frame(coef(summary(model_cardio)))
 head(model_cardio_df)
@@ -1045,15 +1530,16 @@ df_general_model <- df_general %>%
   slice(1) %>%
   ungroup()
 
-View(df_general_model %>% select(c("case_id", "general_persist", "ICU", "Gender", "ppatient_age_years", "ppatient_bmi", "Comorb")))
 
-model_general <- glm(general_persist ~ ICU + ppatient_age_years + Gender  + Comorb, data = df_general_model, family = binomial(link = "logit"))
+formula <- as.formula(paste("general_persist ~", variables))
+
+model_general <- glm(formula, data = df_general_model, family = binomial(link = "logit"))
 
 summary(model_general)
 
 
 #clean up the result table of the model
-rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)")
+rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)", "N° affected organ systems")
 
 model_general_df<- as.data.frame(coef(summary(model_general)))
 head(model_general_df)
@@ -1112,7 +1598,9 @@ df_any_model <- df_any %>%
   slice(1) %>%
   ungroup()
 
-model_any <- glm(any_persist ~ ICU + ppatient_age_years + Gender + Comorb, data = df_any_model, family = binomial(link = "logit"))
+formula <- as.formula(paste("any_persist ~", variables))
+
+model_any <- glm(formula, data = df_any_model, family = binomial(link = "logit"))
 
 summary(model_any)
 
@@ -1120,7 +1608,7 @@ summary(model_any)
 
 #clean up the result table of the model
 
-rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)")
+rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)", "N° affected organ systems")
 
 model_any_df<- as.data.frame(coef(summary(model_any)))
 head(model_any_df)
@@ -1180,15 +1668,15 @@ df_echo_model <- df_echo %>%
   slice(1) %>%
   ungroup()
 
-View(df_echo_model %>% select(c("case_id", "echo_persist", "ICU", "Gender", "ppatient_age_years",  "Comorb")))
+formula <- as.formula(paste("echo_persist ~", variables))
 
-model_echo <- glm(echo_persist ~ ICU + ppatient_age_years + Gender + Comorb, data = df_echo_model, family = binomial(link = "logit"))
+model_echo <- glm(formula, data = df_echo_model, family = binomial(link = "logit"))
 
 summary(model_echo)
 
 #clean up the result table of the model
 
-rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)")
+rownames.model <- c("ICU (ref=no)", "Age (years)", "Gender (ref=male)", "Comorbidity (ref=no)", "N° affected organ systems")
 
 model_echo_df<- as.data.frame(coef(summary(model_echo)))
 head(model_echo_df)
@@ -1336,16 +1824,20 @@ result <- df_coronary %>%
   ungroup() %>%
   filter(coronary == 1) %>% 
   summarise(
+    case_ids = paste(case_id, collapse = ", "), # Concatenate case_ids into a single string
     number_of_patients = n(), # Count the number of patients meeting the condition
     median_time = median(Time, na.rm = TRUE), # Calculate the median Time for these rows
     lowest_time = min(Time, na.rm = TRUE), # Get the lowest Time value
     highest_time = max(Time, na.rm = TRUE) # Get the highest Time value
   )
 
-
-
 # View the result
 print(result)
+
+df_filtered <- df %>%
+  filter(case_id %in% c("3112", "3270")) %>%
+  select(case_id, Time, Visit_Number, starts_with("p2_thr_hemo_type"))
+View(df_filtered)
 
 df_unique <- df %>% 
   group_by(case_id) %>% 
@@ -1393,6 +1885,261 @@ coro_size <- df %>%
 write.csv(cor_tab, "Results/cor_tab.csv")
 View(df %>%
        select(c("case_id", "p2_img_cd_echo_cor_meas2")))
+
+
+subset_data <- df$Time[df$Visit_Number == 1]
+
+# Histogram in base R
+hist(subset_data, breaks = 127)
+
+subset_ids <- df %>%
+  filter(Time == specific_time, Visit_Number == specific_visit) %>%
+  pull(case_id)
+
+#which comorbs are most frequent?
+df_first <- df %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+table(df_first$Comorb)
+
+df_Comorb <- df_first %>%
+  filter(Comorb == 1)
+
+table(df_Comorb$p1_comorb_list___1)
+
+
+vars <- names(df_Comorb)[grepl("^p1_comorb_list___", names(df_Comorb))]
+
+for (var in vars) {
+  cat("\nTable for", var, ":\n")
+  print(table(df_Comorb[[var]]))
+}
+
+
+#which symptoms persist more than one year?
+df_filtered <- df %>%
+  filter(case_id %in% c("2722", "4004", "6387")) %>%
+  select(case_id, Time, Visit_Number, starts_with("p2_sy_sympt_type"))
+
+
+View(df_filtered)
+
+#Unresolved echo findings at latest visit
+df_highest_visit <- df_echo %>%
+  group_by(case_id) %>%
+  filter(Visit_Number == max(Visit_Number)) %>%  
+  ungroup()
+
+
+case_ids_with_echo_1 <- df_highest_visit %>%
+  filter(echo == 1) %>%
+  pull(case_id)  
+
+df_filtered <- df %>%
+  filter(case_id %in% case_ids_with_echo_1)%>%
+  select(case_id, Time, Visit_Number, starts_with("p2_img_cd_echo_"))
+
+View(df_filtered)
+
+#When was the coro case > 1 year resolved?
+
+df_filtered <- df_coronary %>%
+  filter(case_id %in% c(481)) %>%
+  select(case_id, Time, Visit_Number, starts_with("p2_img_cd_echo_"))
+
+
+View(df_filtered)
+
+#compare neuro with symptom___7which neurological symptom persisted?
+ids_symptom_7 <- df %>%
+  filter(p2_sy_sympt_type___7 == 1) %>%
+  pull(case_id) %>%
+  unique()  # Ensure unique case IDs
+
+ids_neuro <- df_neuro %>%
+  filter(neuro == 1) %>%
+  pull(case_id) %>%
+  unique()  # Ensure unique case IDs
+
+ids_neuro_persist <- df_neuro %>%
+  group_by(case_id) %>%
+  slice(-1) %>%
+  filter(neuro==1) %>%
+  pull(case_id) %>%
+  unique()
+
+
+# Display the case_id values
+print(ids_symptom_7)
+print(ids_neuro)
+
+df_filtered <- df_neuro %>%
+  filter(case_id %in% c("1711-10")) %>%
+  select(case_id, Time, Visit_Number, neuro, p2_sy_sympt_type___7, starts_with(c("p2_sy_neuro_type", "pcomp_neuro_type")))
+
+
+
+
+
+df_filtered <- df %>%
+  filter(case_id %in% c("1711-10", "1712-5", "1736-1", "1736-6", "2141", "3118", "6392")) %>%
+  select(case_id, Time, Visit_Number, p1_sy_sympt_type___7, p2_sy_sympt_type___7)
+
+
+View(df_filtered)
+
+
+#how many catecholamines, invasive ventilation?
+#which comorbs are most frequent?
+df_first <- df %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+vars <- names(df_first)[grepl("^pther_artif_resp_type___", names(df_first))]
+
+for (var in vars) {
+  cat("\nTable for", var, ":\n")
+  print(table(df_first[[var]]))
+}
+
+table(df_first$ICU)
+table(df_first$pther_artif_resp_type___3)
+table(df_first$p1_thr_pims_list___3)
+
+# Create a new column for the combination of 1's across the three variables
+df_first <- df_first %>%
+  mutate(
+    comb = case_when(
+      ICU == 1 & pther_artif_resp_type___3 == 1 & p1_thr_pims_list___3 == 1 ~ "ICU, pther_artif_resp_type___3, p1_thr_pims_list___3",
+      ICU == 1 & pther_artif_resp_type___3 == 1 ~ "ICU, pther_artif_resp_type___3",
+      ICU == 1 & p1_thr_pims_list___3 == 1 ~ "ICU, p1_thr_pims_list___3",
+      pther_artif_resp_type___3 == 1 & p1_thr_pims_list___3 == 1 ~ "pther_artif_resp_type___3, p1_thr_pims_list___3",
+      ICU == 1 ~ "ICU",
+      pther_artif_resp_type___3 == 1 ~ "pther_artif_resp_type___3",
+      p1_thr_pims_list___3 == 1 ~ "p1_thr_pims_list___3",
+      TRUE ~ "none"
+    )
+  )
+
+# Now you can use table to get the count of each combination
+table(df_first$Circ.supp)
+
+
+table(df$p2_thr_pims_type___3)
+
+table(df_cardio$cardio_persist, df_cardio$Visit_Number)
+
+ids_cardio_persist <- df_cardio %>%
+  group_by(case_id) %>%
+  filter(cardio_persist==1) %>%
+  pull(case_id) %>%
+  unique()
+
+df_filtered <- df %>%
+  filter(case_id %in% ids_cardio_persist) %>%
+  select(case_id, Time, Visit_Number, p2_sy_cardiac_type___4, p2_sy_cardiac_type___5, p2_sy_cardiac_type___6, p2_sy_cardiac_type___10, p2_sy_cardiac_type___11, p2_sy_cardiac_type___12, p2_sy_cardiac_type___13, p2_sy_cardiac_type___20, p2_sy_cardiac_type____44)
+
+
+View(df_filtered)
+unique(df_filtered$case_id)
+df_filtered <- df %>%
+  filter(p2_thr_pims_type___1==1) %>%
+  select(case_id, Time, Visit_Number,p2_thr_immun_mod_type___2, p2_thr_immun_mod_type___7, p2_thr_immun_mod_type___8)
+
+
+table(df$p2_thr_pims_type___1, df$Visit_Number)
+table(df$p2_thr_hemo_type___4, df$Visit_Number)
+table(df$p2_thr_immun_mod_type___8, df$Visit_Number)
+
+
+
+df_first <- df %>%
+  group_by(case_id) %>%
+  slice(1) %>%
+  ungroup()
+
+table(df_first$Compl.ther)
+
+table(df_neuro$neuro_persist, df_neuro$Visit_Number)
+
+neuro_case <- df_neuro %>%
+  filter(df_neuro$neuro_persist==1) %>%
+  pull(case_id)
+
+df_filtered <- df_neuro %>%
+  filter(case_id %in% "1711-10") %>%
+  select(c(case_id, p2_pat_appt_date, Time, Visit_Number, neuro))
+df_filtered
+
+
+#Apparative Diagnostik
+
+for(i in 1:8) {
+  var_name <- paste0("p2_img_resp_chk___", i)
+  cat("Table for", var_name, ":\n")
+  print(table(df[[var_name]]))
+  cat("\n")
+}
+
+#p2_img_resp_chk___5: Lufu 28 cases
+
+table(df$Visit_Number, df$p2_img_rp_lung_func)
+
+
+
+
+
+for(i in 1:9) {
+  var_name <- paste0("p2_img_cardiac_chk___", i)
+  cat("Table for", var_name, ":\n")
+  print(table(df[[var_name]]))
+  cat("\n")
+}
+
+#p2_img_cardiac_chk___3: Kardio-MR 26 cases
+#p2_img_cardiac_chk___9: Langzeit-EKG 
+
+table(df$Visit_Number, df$p2_img_cd_lekg_brady)
+
+p2_img_cd_ekg_arrhyth
+
+p2_img_cd_lekg_daynite
+p2_img_cd_lekg_sves
+p2_img_cd_lekg_ves
+p2_img_cd_lekg_tachy
+p2_img_cd_lekg_brady
+
+
+p2_img_cd_cmri_lveject
+p2_img_cd_cmri_rveject
+p2_img_cd_cmri_myoedema
+p2_img_cd_crmi_lge
+p2_img_cd_cmri_pericard
+p2_img_cd_cmri_isch
+
+
+
+table(df_lufu$lufu, df_lufu$ICU)
+table(df_lge$lge, df_lge$Age.group)
+table(df_ecg$ecg, df_ecg$ICU)
+
+length(unique(df_lufu$case_id))
+
+
+lufu_case <- df_lufu %>%
+  filter(df_lufu$lufu==1) %>%
+  pull(case_id)
+
+length(lufu_case)
+
+df_filtered <- df_lufu %>%
+  filter(case_id %in% c("384",     "384",     "1331",    "1712-1",  "1736-5",  "1736-9",  "1736-11", "6297")) %>%
+  select(c(case_id, Time,lufu, Visit_Number, p1_sy_sympt_type___3, p2_sy_sympt_type___3, p1_sy_sympt_type___2, p2_sy_sympt_type___2))
+
+View(df_filtered)
 
 ```
 
@@ -1586,7 +2333,6 @@ print(combined_plots[["Hemoglobin_Age.group"]])
 #recreate plots for publication
 ```{r}
 
-
 hemo_p <- ggplot(df, aes(x = Time, y = Hemoglobin, color = factor(Age.group))) +
     geom_point(na.rm = TRUE, alpha=0.5, size=3) +
     geom_smooth(method = "lm", na.rm = TRUE, se = FALSE) +
@@ -1598,7 +2344,7 @@ hemo_p <- ggplot(df, aes(x = Time, y = Hemoglobin, color = factor(Age.group))) +
     ) +
     scale_color_manual(
         values = c("#6495ED", "#8b0000"),
-        labels = c("Young", "Old")
+        labels = c("≤5 years", ">5 years")
     ) +
     theme_minimal() +
     scale_y_log10(limits = c(2.5, 11)) +
@@ -1623,7 +2369,7 @@ lympho_p <- ggplot(df, aes(x = Time, y = Lymphocytes, color = factor(Age.group))
     ) +
     scale_color_manual(
         values = c("#6495ED", "#8b0000"),
-        labels = c("Young", "Old")
+        labels = c("≤5 years", ">5 years")
     ) +
     theme_minimal() +
     scale_y_log10() +
