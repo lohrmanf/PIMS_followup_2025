@@ -26,14 +26,29 @@ library(logistf)
 library(gt)
 library(patchwork)
 library(FactoMineR)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(broom)
+library(flextable)
+library(officer)
 
 dir <- "Results"
 dir.b <- "Results/Barplot"
 
 df<- read_csv("PIMS_BN.csv")
+
+df <- df %>%
+  mutate(
+    across(
+      where(is.numeric),
+      ~ na_if(., -99)
+    )
+  )
+
 ```
 
-# initial setup
+# initial setup, dont run
 ```{r, include=FALSE}
 #import data
 PIMS_all <- fread("PIMS-Erstmeldung-und-Nachsorge-Survey-Export-RAW-20231101.CSV", sep = ";", dec = ",")
@@ -160,14 +175,14 @@ PIMS_BN <- PIMS_BN %>%
   mutate(Time_Interval = Time - Time_Interval) %>%
   mutate(Visit_Number = row_number() - 1)  
 
-write.csv(PIMS_BN, file = "PIMS_BN.csv", row.names = FALSE)
+#write.csv(PIMS_BN, file = "PIMS_BN.csv", row.names = FALSE)
 
 ```
 
 #analysis starts here
 ```{r}
 #search for cols
-term <- "va"
+term <- "crp"
 matching_columns <- grep(term, colnames(df), value = TRUE)
 print(matching_columns)
 
@@ -280,11 +295,9 @@ ggplot(df_filtered, aes(x = as.factor(Visit_Number), y = Time_Interval)) +
 ggsave(paste0(dir, "/Intervals.png"), width=5, height =3, dpi=600)
 ```
 
-
 #Create cols for comparisons
 ```{r}
-#comparisons <- c(ICU, Gender, Age.group, 
-
+#comparisons 
 df <- df %>%
   group_by(case_id) %>% 
   mutate(ICU = ifelse(is.na(first(pther_icu_days)) | first(pther_icu_days) == 0, 0, 1))%>%  
@@ -331,9 +344,6 @@ df <- df %>%
   group_by(case_id) %>% 
   mutate(Circ.supp = ifelse(first(p1_thr_pims_list___3 == 1), 1, 0))%>%  
   ungroup()
-
-
-
 ```
 
 
@@ -351,7 +361,159 @@ df <- df %>%
 
 df_filtered <- df %>%
   select(case_id, Time, Visit_Number, number_symptoms, number_symptoms_admission, starts_with(c("p1_sy_sympt_type___", "p2_sy_sympt_type___")))
+```
 
+
+#compare followed with not-followed
+```{r}
+data <- read.csv("data_completed.csv", 
+                    stringsAsFactors = FALSE)
+
+# Extract the vector of followed names
+followed <- unique(df$case_id)
+
+data.unf <- data %>%
+  filter(!(case_id %in% followed))
+
+data.unf <- data.unf %>%
+  mutate(ICU = if_else(ICU == "yes", 1, 0))
+
+data.fol <- df %>%
+  group_by(case_id) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+
+data.fol$clin_score <- data.fol$number_symptoms_admission
+
+
+#Age, sex, Treatment (also IVIG vs. IVIG + Steroide), Intensive Care treatment, Myokardial dysfunction, Coronary artery aneurysm, ggf. Laborwerte zumindest CRP
+
+continuous <- c('clin_score', 'plab_crp_si_value', 'pther_inpatient_days', "ppatient_age_years")
+categorical <- c("ICU", "pther_immun_mod_type___13", "pther_immun_mod_type___2", "pimg_echo_myocard_yesno", 
+                 "pimg_echo_coronpath_yesno", "ppatient_gender")
+
+continuous[continuous %in% colnames(data.unf)]
+categorical[categorical %in% colnames(data.fol)]
+
+
+# 1. CATEGORICAL COMPARISON (Chi-square or Fisher's)
+cat_summary <- purrr::map_dfr(categorical, function(var) {
+  if (!(var %in% colnames(data.fol)) | !(var %in% colnames(data.unf))) {
+    warning(paste("Variable", var, "not found in both datasets. Skipping."))
+    return(NULL)
+  }
+
+  fol_var <- data.fol[[var]]
+  unf_var <- data.unf[[var]]
+  
+  # Remove NAs
+  fol_var <- fol_var[!is.na(fol_var)]
+  unf_var <- unf_var[!is.na(unf_var)]
+
+  tab <- table(factor(c(fol_var, unf_var)), 
+               group = rep(c("followed", "unfollowed"), 
+                           c(length(fol_var), length(unf_var))))
+  
+  if (ncol(tab) < 2) {
+    warning(paste("Variable", var, "does not have both groups. Skipping."))
+    return(NULL)
+  }
+
+  test <- if (any(tab < 5)) fisher.test(tab) else chisq.test(tab)
+
+  purrr::map_dfr(rownames(tab), function(level) {
+    followed_count <- tab[level, "followed"]
+    followed_total <- sum(tab[, "followed"])
+    unfollowed_count <- tab[level, "unfollowed"]
+    unfollowed_total <- sum(tab[, "unfollowed"])
+
+    tibble(
+      variable = var,
+      level = level,
+      Followed = sprintf(
+        "%d/%d (%.1f%%)",
+        followed_count, followed_total, 100 * followed_count / followed_total
+      ),
+      Not_followed = sprintf(
+        "%d/%d (%.1f%%)",
+        unfollowed_count, unfollowed_total, 100 * unfollowed_count / unfollowed_total
+      ),
+      p_value = signif(test$p.value, 3)
+    )
+  })
+})
+
+# 2. CONTINUOUS COMPARISON (Wilcoxon test, median/IQR-range)
+cont_summary <- purrr::map_dfr(continuous, function(var) {
+  if (!(var %in% colnames(data.fol)) | !(var %in% colnames(data.unf))) {
+    warning(paste("Variable", var, "not found in both datasets. Skipping."))
+    return(NULL)
+  }
+
+  fol_var <- data.fol[[var]] %>% na.omit()
+  unf_var <- data.unf[[var]] %>% na.omit()
+
+  if (length(fol_var) == 0 | length(unf_var) == 0) {
+    return(tibble(variable = var, level = NA, Followed = NA, Not_followed = NA, p_value = NA))
+  }
+
+  # Wilcoxon test
+  test <- wilcox.test(fol_var, unf_var)
+
+  tibble(
+    variable = var,
+    level = NA,
+    Followed = sprintf("%.1f (%.1f–%.1f)", median(fol_var), IQR(fol_var), max(fol_var) - min(fol_var)),
+    Not_followed = sprintf("%.1f (%.1f–%.1f)", median(unf_var), IQR(unf_var), max(unf_var) - min(unf_var)),
+    p_value = signif(test$p.value, 3)
+  )
+})
+
+
+# 3. Combine and adjust p-values
+final_table <- bind_rows(cat_summary, cont_summary) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    p_adj = ifelse(p_adj < 0.001, "<0.001", sprintf("%.3f", p_adj))
+  ) %>%
+  select(variable, level, Followed, Not_followed, p_adj)
+
+# 4. Optional filtering
+filtered_final_table <- final_table %>%
+  slice(-c(1, 3, 5, 7, 8, 10, 11, 13, 14)) %>%
+  filter(!variable %in% c("p_value", "level")) %>%
+  select(-level)  # <- remove the column explicitly
+
+
+
+filtered_final_table <- filtered_final_table %>%
+  rename(
+    Variable = variable,
+    'Not followed' = Not_followed
+  )
+
+name_map <- c('clin_score'="N° of affected organ systems", 
+              'plab_crp_si_value' = "CRP (mg/l)", 
+              'pther_inpatient_days' = "Days of hospitalisation", 
+              "ppatient_age_years" = "Patient age (years)", 
+              "ICU" = "ICU",
+              "pther_immun_mod_type___13" = "IVIGs", 
+              "pther_immun_mod_type___2" = "Corticosteroids", 
+              "pimg_echo_myocard_yesno" ="Myocardial dysfunction", 
+              "pimg_echo_coronpath_yesno" = "Coronary dilatation", 
+              "ppatient_gender" = "Patient gender (female)")
+
+filtered_final_table <- filtered_final_table %>%
+  mutate(Variable = ifelse(Variable %in% names(name_map), name_map[Variable], Variable))
+
+# Show and print result
+ft <- flextable(filtered_final_table)
+
+doc <- read_docx() %>%
+  body_add_flextable(ft)
+
+print(doc, target = "table_comparison.docx")
 ```
 
 
@@ -374,14 +536,61 @@ ggplot(df_summary, aes(x = as.factor(Visit_Number), y = patient_count, fill = as
   scale_color_identity() +  
   theme_minimal()
 
-
-ggsave(paste0(dir, "/bar_Number of symptoms.png"), dpi = 600, width = 5, height = 6.1)
-
+ggsave(paste0(dir, "/bar_Number of symptoms.png"), dpi = 600, width = 5, height = 4)
 
 ```
 
+
+#spaghetti plot on recovey
+```{r}
+# 1) Summarise per patient, then per group
+summary_df <- df %>%
+  group_by(case_id) %>%
+  arrange(Time) %>%
+  reframe(
+    baseline_symptoms = first(number_symptoms),
+    time_to_zero = first(Time[number_symptoms == 0])
+  ) %>%
+  summarize(
+    median_baseline     = median(baseline_symptoms, na.rm = TRUE),
+    median_time_to_zero = median(time_to_zero,     na.rm = TRUE),
+    .groups = "drop"
+  )
+head(summary_df)
+
+ggplot(df, aes(x = Time, y = number_symptoms, group = case_id)) +
+  geom_line(color = "cornflowerblue", linewidth = 0.7, alpha = 0.2) +
+  
+  geom_segment(
+    data = summary_df,
+    inherit.aes = FALSE,
+    aes(x = 0,
+        y = median_baseline,
+        xend = median_time_to_zero,
+        yend = 0),
+    color = "darkblue",  # different color for median segment
+    linewidth = 1.5
+  ) +
+
+  coord_cartesian(xlim = c(0, 500)) +
+  
+  labs(
+    x     = "Days",
+    y     = "N° of affected organ systems",
+    title = "Individual recovery trajectories"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "none"  # <- remove legend
+  )
+
+ggsave(paste0(dir, "/spaghetti_recovery.png"), dpi = 600, width = 5, height = 4)
+```
+
+
 # categorical variable
-#filter for patients with symptom present during initial stay and on at least one follow-up
+#filter for patients with symptom present during initial stay and on at least one follow-up 
 ```{r}
 #1. myocardial dysfunction
 df_myocard <- df %>%
@@ -502,8 +711,6 @@ create_subsets <- function(df) {
 
 create_subsets(df)
 
-
-
 df_cardio <- df_cardio %>%
   group_by(case_id) %>% 
   mutate(cardio_persist = as.integer(any(replace_na(cardio[Visit_Number >= 1], 0) == 1))) %>% 
@@ -523,11 +730,6 @@ for (df_name in df_list) {
     mutate(!!persist_col := as.integer(any(replace_na(.data[[condition_col]][Visit_Number >= 1], 0) == 1))) %>%
     ungroup())
 }
-
-
-#View(df_general %>% select(c("case_id", "general", "Time", "Visit_Number", "ICU", "general_persist")))
-
-
 
 #create "any symptom" df
 all_suffix_numbers <- 1:14
@@ -559,10 +761,7 @@ df_any <- df_any %>%
 
 dim(df_any)
 
-
 #create any echo col
-
-
 # Perform table on Age.group for unique case_id
 p1_cols <- c("pimg_echo_myocard_yesno",
              "pimg_echo_valvulit_yesno",
@@ -608,8 +807,6 @@ df_echo <- df_echo %>%
     )
   )
 
-#View(df_echo   %>% select(c("case_id", "Visit_Number", "echo", "echo_mod", "echo_persist")))
-
 
 #cardiac MRI
 df_lge <- df %>%
@@ -640,12 +837,11 @@ df_lufu <- df %>%
 df_lufu <- df_lufu %>%
   mutate(lufu = na_if(p2_img_rp_lung_func, -99))
 
-table(df_lufu$lufu)
-
 ```
 
 
 #plot bar chart
+#create custom labels
 ```{r}
 # Plot stacked bar chart split by variable
 group_var <- "Age.group"  
@@ -659,163 +855,6 @@ custom_labels <- list(
 )
 ```
 
-#plot all bar plots
-```{r}
-#echo
-plot_echo <- df_echo %>% 
-  filter(!is.na(echo_mod)) %>% 
-  group_by(Visit_Number, .data[[group_var]], echo_mod) %>% 
-  summarise(count = n(), .groups = "drop") 
-
-# Generate plot
-ggplot(plot_echo, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(echo_mod, labels = c("No", "Yes")))) +
-  geom_bar(stat = "identity", position = "stack") +
-  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
-  scale_fill_manual(values = c("cornflowerblue", "brown")) +
-  facet_wrap(as.formula(paste("~", group_var)), 
-             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
-  labs(x = "Visit number", y = "Number of patients", fill = "Echocardiographic \npathology") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
-
-# Save plot
-ggsave(paste0(dir.b, "/bar_echo_", group_var, ".png"), dpi = 600, width = 5, height = 3)
-
-
-#myocard
-plot_myocard <- df_myocard %>% 
-  filter(!is.na(myocard_mod)) %>% 
-  group_by(Visit_Number, .data[[group_var]], myocard_mod) %>% 
-  summarise(count = n(), .groups = "drop") 
-
-# Generate plot
-ggplot(plot_myocard, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(myocard_mod, labels = c("No", "Yes")))) +
-  geom_bar(stat = "identity", position = "stack") +
-  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
-  scale_fill_manual(values = c("cornflowerblue", "brown")) +
-  facet_wrap(as.formula(paste("~", group_var)), 
-             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
-  labs(x = "Visit number", y = "Number of patients", fill = "Myocardial \ndysfunction") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
-
-# Save plot
-ggsave(paste0(dir.b, "/bar_myocard_", group_var, ".png"), dpi = 600, width = 5, height = 3)
-
-
-#coronary
-plot_coronary <- df_coronary %>% 
-  filter(!is.na(coronary_mod)) %>% 
-  group_by(Visit_Number, .data[[group_var]], coronary_mod) %>% 
-  summarise(count = n(), .groups = "drop") 
-
-# Generate plot
-ggplot(plot_coronary, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(coronary_mod, labels = c("No", "Yes")))) +
-  geom_bar(stat = "identity", position = "stack") +
-  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
-  scale_fill_manual(values = c("cornflowerblue", "brown")) +
-  facet_wrap(as.formula(paste("~", group_var)), 
-             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
-  labs(x = "Visit number", y = "Number of patients", fill = "Coronary \ndilatation") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
-
-# Save plot
-ggsave(paste0(dir.b, "/bar_coronary_", group_var, ".png"), dpi = 600, width = 5, height = 3)
-
-
-#cardio
-plot_cardio <- df_cardio %>% 
-  filter(!is.na(cardio)) %>% 
-  group_by(Visit_Number, .data[[group_var]], cardio) %>% 
-  summarise(count = n(), .groups = "drop")
-
-# Generate plot
-ggplot(plot_cardio, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(cardio, labels = c("No", "Yes")))) +
-  geom_bar(stat = "identity", position = "stack") +
-  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
-  scale_fill_manual(values = c("cornflowerblue", "brown")) +
-  facet_wrap(as.formula(paste("~", group_var)), 
-             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
-  labs(x = "Visit number", y = "Number of patients", fill = "Cardiovascular \nsymptoms") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
-
-# Save plot
-ggsave(paste0(dir.b, "/bar_cardio_", group_var, ".png"), dpi = 600, width = 5, height = 3)
-
-
-#general
-plot_general <- df_general %>% 
-  filter(!is.na(general)) %>% 
-  group_by(Visit_Number, .data[[group_var]], general) %>% 
-  summarise(count = n(), .groups = "drop") 
-
-# Generate plot
-ggplot(plot_general, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(general, labels = c("No", "Yes")))) +
-  geom_bar(stat = "identity", position = "stack") +
-  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
-  scale_fill_manual(values = c("cornflowerblue", "brown")) +
-  facet_wrap(as.formula(paste("~", group_var)), 
-             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
-  labs(x = "Visit number", y = "Number of patients", fill = "General \nsymptoms") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
-
-# Save plot
-ggsave(paste0(dir.b, "/bar_general_", group_var, ".png"), dpi = 600, width = 5, height = 3)
-
-
-#Any symptom
-plot_any <- df_any %>% 
-  filter(!is.na(any_p2_1)) %>% 
-  group_by(Visit_Number, .data[[group_var]], any_p2_1) %>% 
-  summarise(count = n(), .groups = "drop") 
-
-# Generate plot
-ggplot(plot_any, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(any_p2_1, labels = c("No", "Yes")))) +
-  geom_bar(stat = "identity", position = "stack") +
-  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
-  scale_fill_manual(values = c("cornflowerblue", "brown")) +
-  facet_wrap(as.formula(paste("~", group_var)), 
-             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
-  labs(x = "Visit number", y = "Number of patients", fill = "Any \nsymptoms") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
-
-# Save plot
-ggsave(paste0(dir.b, "/bar_any_", group_var, ".png"), dpi = 600, width = 5, height = 3)
-
-
-#Neuro symptom
-plot_neuro <- df_neuro %>% 
-  filter(!is.na(neuro)) %>% 
-  group_by(Visit_Number, .data[[group_var]], neuro) %>% 
-  summarise(count = n(), .groups = "drop") 
-
-# Generate plot
-ggplot(plot_neuro, aes(x = factor(Visit_Number), y = count, 
-                         fill = factor(neuro, labels = c("No", "Yes")))) +
-  geom_bar(stat = "identity", position = "stack") +
-  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
-  scale_fill_manual(values = c("cornflowerblue", "brown")) +
-  facet_wrap(as.formula(paste("~", group_var)), 
-             labeller = labeller(!!sym(group_var) := custom_labels[[group_var]])) +  
-  labs(x = "Visit number", y = "Number of patients", fill = "Neuromuscular \nsymptoms") +
-  theme_minimal()+
-  theme(strip.text = element_text(size = 12, face = "plain"))
-
-# Save plot
-ggsave(paste0(dir.b, "/bar_neuro_", group_var, ".png"), dpi = 600, width = 5, height = 3)
-
-
-```
 
 #plot final selection including layout
 ```{r}
@@ -1093,6 +1132,7 @@ skin_plot+gastro_plot+musculo_plot+plot_layout(ncol=3)
 ggsave(paste0(dir, "/bar_clin_no_comparison.png"), dpi = 600, width = 10.2, height = 3)
 
 ```
+
 
 
 ```{r}
@@ -1373,46 +1413,9 @@ ggsave(paste0(dir, "/bar_functional_diag.png"), dpi = 600, width = 10.2, height 
 
 
 #linear models
-
-#Exploratory models
-```{r}
-
-#myocard
-
-#condense into one line per patient
-df_myocard_model <- df_myocard %>%
-  group_by(case_id) %>%
-  slice(1) %>%
-  ungroup()
-
-View(df_myocard_model %>% select(c("case_id", "myocard_persist", "ICU", "Gender", "ppatient_age_years", "ppatient_bmi", "Comorb")))
-
-model_myoc <- glm(myocard_persist ~ ICU + ppatient_age_years + Gender + Comorb, data = df_myocard_model, family = binomial(link = "logit"))
-
-summary(model_myoc)
-
-#coronary
-
-#condense into one line per patient
-df_coronary_model <- df_coronary %>%
-  group_by(case_id) %>%
-  slice(1) %>%
-  ungroup()
-
-#View(df_coronary_model %>% select(c("case_id", "coronary_persist", "ICU", "Gender", "ppatient_age_years", "ppatient_bmi", "Comorb")))
-
-model_coro <- glm(coronary_persist ~ ICU + ppatient_age_years + Gender + Comorb, data = df_coronary_model, family = binomial(link = "logit"))
-
-summary(model_coro)
-```
-
 #models to keep and clean
 ```{r}
 variables <- "ICU + ppatient_age_years + Gender + Comorb + number_symptoms_admission"
-
-
-
-#pooled variables
 
 ```
 
@@ -1773,388 +1776,9 @@ gtsave(echo_gt, filename = "Results/echo_gt_glm.png")
 ```
 
 
-#explore some cohort variables
-```{r}
-head(df)
-range(df$ppatient_admission_date)
-df$p2_pat_appt_date <- as.Date(df$p2_pat_appt_date)
-range(df$p2_pat_appt_date, na.rm = TRUE)
-
-str(df$p2_pat_appt_date)
-
-hist(df$Visit_Number)
-median_value <- median(df$Visit_Number[df$Visit_Number != 0], na.rm = TRUE)
-median(df$Visit_Number)
-# Print the result
-print(median_value)
-
-table(df$pcomorb_pims_chk)
-
-case_ids <- df_myocard$case_id[df_myocard$myocard_persist == 1]
-
-unique_case_ids <- unique(case_ids)
-
-#"1331" "6392"
-
-case_coro <- df_coronary$case_id[df_coronary$coronary_persist == 1]
-unique_case_coro <- unique(case_coro)
-
-#"481"     "637"     "1711-6"  "1712-1"  "1736-10" "3111"    "3112"    "3270"    "4900"  "4905"    "6036"    "6052"    "6379"    "7402" 
-
-filtered_any_persist <- df_any %>%
-  filter(case_id %in% unique_case_coro) %>%
-  select(case_id, any_persist)
-
-# View the result
-View(filtered_any_persist)
-
-View(df_coronary)
-table(df_coronary$p2_img_cd_echo_coronpath, df_coronary$Visit_Number)
-table(df_coronary$pimg_echo_coronpath_yesno, df_coronary$Visit_Number)
-table(df_coronary$coronary_persist, df_coronary$Visit_Number)
-
-table(df_myocard$p2_img_cd_echo_myocard)
-
-View(df_myocard %>% select(c("case_id", "myocard", "Visit_Number", "Time")))
-
-
-result <- df_coronary %>%
-  group_by(case_id) %>%
-  filter(Visit_Number == max(Visit_Number)) %>% # Select rows with the highest Visit_Number 
-  ungroup() %>%
-  filter(coronary == 1) %>% 
-  summarise(
-    case_ids = paste(case_id, collapse = ", "), # Concatenate case_ids into a single string
-    number_of_patients = n(), # Count the number of patients meeting the condition
-    median_time = median(Time, na.rm = TRUE), # Calculate the median Time for these rows
-    lowest_time = min(Time, na.rm = TRUE), # Get the lowest Time value
-    highest_time = max(Time, na.rm = TRUE) # Get the highest Time value
-  )
-
-# View the result
-print(result)
-
-df_filtered <- df %>%
-  filter(case_id %in% c("3112", "3270")) %>%
-  select(case_id, Time, Visit_Number, starts_with("p2_thr_hemo_type"))
-View(df_filtered)
-
-df_unique <- df %>% 
-  group_by(case_id) %>% 
-  slice(1)  # Retains the first row for each unique case_id
-
-# Perform table on Age.group for unique case_id
-table(df_unique$Age.group)
-
-
-
-df_coro_unique <- df_coronary %>% 
-  group_by(case_id) %>% 
-  slice(1) 
-
-table(df_coro_unique$coronary_persist)
-
-case_ids_with_myocard_persist <- df_myocard_unique %>%
-  filter(myocard_persist == 1) %>%
-  pull(case_id)
-
-
-###additional coronary parameters
-table(df$p2_img_cd_echo_coroneury)
-
-coro_aneurysm <- df %>%
-  group_by(case_id) %>%                                   # Group by case_id
-  filter(any(p2_img_cd_echo_coroneury == "1")) %>%        # Keep groups where any row has a 1 in p2_img_cd_echo_coroneury
-  select(case_id, Time, p2_img_cd_echo_coroneury,         # Select the desired columns
-         p2_img_cd_echo_coronpath, Visit_Number, 
-         pimg_echo_coroneury_yesno) %>%
-  ungroup()                                               # Ungroup to clean up
-
-# Display the result
-print(coro_aneurysm)
-
-cor_tab <- table(df$p2_img_cd_echo_cor_meas2)
-
-coro_size <- df %>%
-  group_by(case_id) %>%                                   # Group by case_id
-  filter(!is.na(p2_img_cd_echo_cor_meas2)) %>%            # Keep rows where p2_img_cd_echo_cor_meas2 is not NA
-  select(case_id, Time, p2_img_cd_echo_cor_meas2,         # Select the desired columns
-         p2_img_cd_echo_coronpath, Visit_Number, p2_pat_weight, p2_pat_height) %>%
-  ungroup()   
-
-write.csv(cor_tab, "Results/cor_tab.csv")
-View(df %>%
-       select(c("case_id", "p2_img_cd_echo_cor_meas2")))
-
-
-subset_data <- df$Time[df$Visit_Number == 1]
-
-# Histogram in base R
-hist(subset_data, breaks = 127)
-
-subset_ids <- df %>%
-  filter(Time == specific_time, Visit_Number == specific_visit) %>%
-  pull(case_id)
-
-#which comorbs are most frequent?
-df_first <- df %>%
-  group_by(case_id) %>%
-  slice(1) %>%
-  ungroup()
-
-table(df_first$Comorb)
-
-df_Comorb <- df_first %>%
-  filter(Comorb == 1)
-
-table(df_Comorb$p1_comorb_list___1)
-
-
-vars <- names(df_Comorb)[grepl("^p1_comorb_list___", names(df_Comorb))]
-
-for (var in vars) {
-  cat("\nTable for", var, ":\n")
-  print(table(df_Comorb[[var]]))
-}
-
-
-#which symptoms persist more than one year?
-df_filtered <- df %>%
-  filter(case_id %in% c("2722", "4004", "6387")) %>%
-  select(case_id, Time, Visit_Number, starts_with("p2_sy_sympt_type"))
-
-
-View(df_filtered)
-
-#Unresolved echo findings at latest visit
-df_highest_visit <- df_echo %>%
-  group_by(case_id) %>%
-  filter(Visit_Number == max(Visit_Number)) %>%  
-  ungroup()
-
-
-case_ids_with_echo_1 <- df_highest_visit %>%
-  filter(echo == 1) %>%
-  pull(case_id)  
-
-df_filtered <- df %>%
-  filter(case_id %in% case_ids_with_echo_1)%>%
-  select(case_id, Time, Visit_Number, starts_with("p2_img_cd_echo_"))
-
-View(df_filtered)
-
-#When was the coro case > 1 year resolved?
-
-df_filtered <- df_coronary %>%
-  filter(case_id %in% c(481)) %>%
-  select(case_id, Time, Visit_Number, starts_with("p2_img_cd_echo_"))
-
-
-View(df_filtered)
-
-#compare neuro with symptom___7which neurological symptom persisted?
-ids_symptom_7 <- df %>%
-  filter(p2_sy_sympt_type___7 == 1) %>%
-  pull(case_id) %>%
-  unique()  # Ensure unique case IDs
-
-ids_neuro <- df_neuro %>%
-  filter(neuro == 1) %>%
-  pull(case_id) %>%
-  unique()  # Ensure unique case IDs
-
-ids_neuro_persist <- df_neuro %>%
-  group_by(case_id) %>%
-  slice(-1) %>%
-  filter(neuro==1) %>%
-  pull(case_id) %>%
-  unique()
-
-
-# Display the case_id values
-print(ids_symptom_7)
-print(ids_neuro)
-
-df_filtered <- df_neuro %>%
-  filter(case_id %in% c("1711-10")) %>%
-  select(case_id, Time, Visit_Number, neuro, p2_sy_sympt_type___7, starts_with(c("p2_sy_neuro_type", "pcomp_neuro_type")))
-
-
-
-
-
-df_filtered <- df %>%
-  filter(case_id %in% c("1711-10", "1712-5", "1736-1", "1736-6", "2141", "3118", "6392")) %>%
-  select(case_id, Time, Visit_Number, p1_sy_sympt_type___7, p2_sy_sympt_type___7)
-
-
-View(df_filtered)
-
-
-#how many catecholamines, invasive ventilation?
-#which comorbs are most frequent?
-df_first <- df %>%
-  group_by(case_id) %>%
-  slice(1) %>%
-  ungroup()
-
-vars <- names(df_first)[grepl("^pther_artif_resp_type___", names(df_first))]
-
-for (var in vars) {
-  cat("\nTable for", var, ":\n")
-  print(table(df_first[[var]]))
-}
-
-table(df_first$ICU)
-table(df_first$pther_artif_resp_type___3)
-table(df_first$p1_thr_pims_list___3)
-
-# Create a new column for the combination of 1's across the three variables
-df_first <- df_first %>%
-  mutate(
-    comb = case_when(
-      ICU == 1 & pther_artif_resp_type___3 == 1 & p1_thr_pims_list___3 == 1 ~ "ICU, pther_artif_resp_type___3, p1_thr_pims_list___3",
-      ICU == 1 & pther_artif_resp_type___3 == 1 ~ "ICU, pther_artif_resp_type___3",
-      ICU == 1 & p1_thr_pims_list___3 == 1 ~ "ICU, p1_thr_pims_list___3",
-      pther_artif_resp_type___3 == 1 & p1_thr_pims_list___3 == 1 ~ "pther_artif_resp_type___3, p1_thr_pims_list___3",
-      ICU == 1 ~ "ICU",
-      pther_artif_resp_type___3 == 1 ~ "pther_artif_resp_type___3",
-      p1_thr_pims_list___3 == 1 ~ "p1_thr_pims_list___3",
-      TRUE ~ "none"
-    )
-  )
-
-# Now you can use table to get the count of each combination
-table(df_first$Circ.supp)
-
-
-table(df$p2_thr_pims_type___3)
-
-table(df_cardio$cardio_persist, df_cardio$Visit_Number)
-
-ids_cardio_persist <- df_cardio %>%
-  group_by(case_id) %>%
-  filter(cardio_persist==1) %>%
-  pull(case_id) %>%
-  unique()
-
-df_filtered <- df %>%
-  filter(case_id %in% ids_cardio_persist) %>%
-  select(case_id, Time, Visit_Number, p2_sy_cardiac_type___4, p2_sy_cardiac_type___5, p2_sy_cardiac_type___6, p2_sy_cardiac_type___10, p2_sy_cardiac_type___11, p2_sy_cardiac_type___12, p2_sy_cardiac_type___13, p2_sy_cardiac_type___20, p2_sy_cardiac_type____44)
-
-
-View(df_filtered)
-unique(df_filtered$case_id)
-df_filtered <- df %>%
-  filter(p2_thr_pims_type___1==1) %>%
-  select(case_id, Time, Visit_Number,p2_thr_immun_mod_type___2, p2_thr_immun_mod_type___7, p2_thr_immun_mod_type___8)
-
-
-table(df$p2_thr_pims_type___1, df$Visit_Number)
-table(df$p2_thr_hemo_type___4, df$Visit_Number)
-table(df$p2_thr_immun_mod_type___8, df$Visit_Number)
-
-
-
-df_first <- df %>%
-  group_by(case_id) %>%
-  slice(1) %>%
-  ungroup()
-
-table(df_first$Compl.ther)
-
-table(df_neuro$neuro_persist, df_neuro$Visit_Number)
-
-neuro_case <- df_neuro %>%
-  filter(df_neuro$neuro_persist==1) %>%
-  pull(case_id)
-
-df_filtered <- df_neuro %>%
-  filter(case_id %in% "1711-10") %>%
-  select(c(case_id, p2_pat_appt_date, Time, Visit_Number, neuro))
-df_filtered
-
-
-#Apparative Diagnostik
-
-for(i in 1:8) {
-  var_name <- paste0("p2_img_resp_chk___", i)
-  cat("Table for", var_name, ":\n")
-  print(table(df[[var_name]]))
-  cat("\n")
-}
-
-#p2_img_resp_chk___5: Lufu 28 cases
-
-table(df$Visit_Number, df$p2_img_rp_lung_func)
-
-
-
-
-
-for(i in 1:9) {
-  var_name <- paste0("p2_img_cardiac_chk___", i)
-  cat("Table for", var_name, ":\n")
-  print(table(df[[var_name]]))
-  cat("\n")
-}
-
-#p2_img_cardiac_chk___3: Kardio-MR 26 cases
-#p2_img_cardiac_chk___9: Langzeit-EKG 
-
-table(df$Visit_Number, df$p2_img_cd_lekg_brady)
-
-p2_img_cd_ekg_arrhyth
-
-p2_img_cd_lekg_daynite
-p2_img_cd_lekg_sves
-p2_img_cd_lekg_ves
-p2_img_cd_lekg_tachy
-p2_img_cd_lekg_brady
-
-
-p2_img_cd_cmri_lveject
-p2_img_cd_cmri_rveject
-p2_img_cd_cmri_myoedema
-p2_img_cd_crmi_lge
-p2_img_cd_cmri_pericard
-p2_img_cd_cmri_isch
-
-
-
-table(df_lufu$lufu, df_lufu$ICU)
-table(df_lge$lge, df_lge$Age.group)
-table(df_ecg$ecg, df_ecg$ICU)
-
-length(unique(df_lufu$case_id))
-
-
-lufu_case <- df_lufu %>%
-  filter(df_lufu$lufu==1) %>%
-  pull(case_id)
-
-length(lufu_case)
-
-df_filtered <- df_lufu %>%
-  filter(case_id %in% c("384",     "384",     "1331",    "1712-1",  "1736-5",  "1736-9",  "1736-11", "6297")) %>%
-  select(c(case_id, Time,lufu, Visit_Number, p1_sy_sympt_type___3, p2_sy_sympt_type___3, p1_sy_sympt_type___2, p2_sy_sympt_type___2))
-
-View(df_filtered)
-
-```
-
-
-
-
-
-
 
 ```{r}
 #Check presence of symptom at 365 days and number of fully recovered at 365 days
-#View(df_any %>% select("case_id", "redcap_repeat_instance_l", "Time", "neuro"))
-
-
-
 # Filter the cases and extract their case_id
 identified_cases <- df_coronary %>%
   filter(coronary == 1 & Time > 364) %>%
@@ -2167,7 +1791,6 @@ count <- nrow(identified_cases)
 cat("Number of patients with symptom == 1 and Time > 364:", count, "\n")
 
 cat("Case IDs:", paste(identified_cases$case_id, collapse = ", "), "\n")
-
 
 ```
 
@@ -2195,24 +1818,6 @@ create_lab_values <- function(df, plab_cols, p2_lab_cols, lab_names) {
 df <- create_lab_values(df, plab, p2_lab, lab_names)
 
 
-```
-
-#individual plot
-```{r}
-ggplot(df, aes(x = Time, y = df$'pro-BNP', color = factor(ICU))) +
-  geom_point(na.rm = TRUE) +  
-  geom_smooth(method = "lm", na.rm = TRUE, se = FALSE) +  
-  labs(color = "ICU") +  
-  scale_color_manual(values = c("#6495ED", "#8b0000"),  
-    labels = c("no", "yes")) +  
-  theme_minimal()+
-  scale_y_log10()+
-  labs(title= "pro-BNP",
-    x = "Days", 
-    y = "pmol/l (log10)", 
-    color = "ICU")
-
-ggsave(paste0(dir, "/Scatter_CRP.png"), width = 6, height = 3, dpi = 600)
 ```
 
 #create all scatter plots
@@ -2259,74 +1864,6 @@ normal_ranges <- list(
   "CK-MB"=c(25), 
   "Lipase"= c(120)
   )
-
-```
-
-```{r}
-lab_names_vector <- setNames(lab_names, lab_names)
-y_labels_vector <- setNames(y_labels, lab_names)
-
-generate_plot <- function(df, variable, comparison) {
-  # Retrieve the lab name and y-axis label based on the variable
-  lab_name <- lab_names_vector[[variable]]
-  y_label <- y_labels_vector[[variable]]
-  
-  # Retrieve the comparison title and legend labels
-  comparison_title <- comparison_titles[[comparison]]
-  legend_labels <- legend_labels_dict[[comparison]]
-  
-  # Retrieve the normal range for the variable
-  normal_range <- normal_ranges[[variable]]
-  
-  # Generate the plot
-  p <- ggplot(df, aes(x = Time, y = .data[[variable]], color = factor(.data[[comparison]]))) +
-    geom_point(na.rm = TRUE) +
-    geom_smooth(method = "lm", na.rm = TRUE, se = FALSE) +
-    labs(color = comparison_title) +
-    scale_color_manual(values = c("#6495ED", "#8b0000"), labels = legend_labels) +
-    theme_minimal() +
-    scale_y_log10() +
-    scale_x_continuous(
-      name = "Days",          
-      breaks = seq(0, 500, 100),  
-      limits = c(0, 500)      
-    ) +
-    labs(
-      title = lab_name,
-      y = paste0(y_label, " (log10)"),
-      color = comparison_title
-    )
-  
-  # Add horizontal dashed lines for normal range if available
-  if (!is.null(normal_range)) {
-    p <- p + geom_hline(yintercept = normal_range, linetype = "dashed", color = "grey")
-  }
-  
-  return(p)
-}
-
-
-```
-
-```{r}
-
-combined_plots <- list()
-
-for (variable in lab_names) {
-  for (comparison in names(comparison_titles)) {
-    # Generate the plot
-    plot <- generate_plot(df, variable, comparison)
-    
-    # Create a key to store the plot in the list (e.g., "pro-BNP_ICU")
-    plot_name <- paste(variable, comparison, sep = "_")
-    
-    # Store the plot in the list
-    combined_plots[[plot_name]] <- plot
-  }
-}
-
-print(combined_plots[["Hemoglobin_Age.group"]])
-
 
 ```
 
